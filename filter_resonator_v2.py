@@ -26,7 +26,7 @@ def resonator_filter(signal, fs, f0, alpha):
     z_n = 0j
     for i, u in enumerate(x):
         z_n = Z * z_n + u
-        y[i] = np.real(z_n)
+        y[i] = np.imag(z_n)
     return y
 
 def freqs(N, base_freq, spacing):
@@ -34,6 +34,9 @@ def freqs(N, base_freq, spacing):
     for _ in range(N):
         yield f
         f *= spacing
+
+
+
 
 # initial frequencies
 filter_freqs = list(freqs(params["N"], params["base_freq"], params["spacing"]))
@@ -64,6 +67,44 @@ def callback(outdata, frames, time, status):
 
         # Reset states (or keep them if you prefer)
         states = [0j for _ in filter_freqs]
+        lenght = len(states)
+        M = np.zeros((lenght, lenght))
+
+        #Nearest neighbor coupling
+        df = np.mean(np.diff(filter_freqs))
+        a = np.zeros((lenght, lenght))
+        for i in range(lenght):
+            for j in range(lenght):
+                a[i, j] = np.exp(-abs(filter_freqs[i] - filter_freqs[j]) / df)
+                
+        #Distribution Matrix
+        lambda_ = 0.1
+        eta = 1.0
+
+        M = eta * lambda_ * (a/np.sum(a, axis=1, keepdims=True)) - lambda_ * np.eye(lenght)
+
+        #Threshold
+        T = 0.5
+
+        #Modal Power Distribution
+        P = 0.5 * (np.real(states)**2)
+        print(P)
+        #Transfer Vector
+        excess = np.maximum(P-T, 0)
+        t = M.dot(excess)
+        
+
+        #amp scaling
+        amp = np.ones(lenght)
+        mag2 = np.real(states)**2 + np.imag(states)**2
+
+        for i in range(lenght):
+            if mag2[i] > 0:
+                amp[i] = 1 + 2 * (t[i] / mag2[i])
+            else:
+                amp[i] = 1.0 + 2 * t[i]
+
+            
 
     out = np.zeros(frames)
 
@@ -73,6 +114,33 @@ def callback(outdata, frames, time, status):
         s = 0.0
         for k in range(len(states)):
             states[k] = Z[k] * states[k] + u
+
+            lenght = len(states)
+
+            #Nearest neighbor coupling
+            df = np.mean(np.diff(filter_freqs))
+            a = np.zeros((lenght, lenght))
+            for i in range(lenght):
+                for j in range(lenght):
+                    a[i, j] = np.exp(-abs(filter_freqs[i] - filter_freqs[j]) / df)
+
+            #Distribution Matrix
+            lambda_ = 0.1
+            eta = 1.0
+            M = eta * lambda_ * (a/np.sum(a, axis=1, keepdims=True)) - lambda_ * np.eye(lenght)
+            P = 0.5 * (np.real(states)**2+ np.imag(states)**2)
+            excess = np.maximum(P-0.5, 0)
+            t = M.dot(excess)
+
+            #amp scaling
+            amp = np.ones(lenght)
+            mag2 = np.real(states)**2 + np.imag(states)**2
+            
+            for i in range(lenght):
+                if mag2[i] > 0:
+                    amp[i] = 1 + 2 * (t[i] / mag2[i])
+                else:
+                    amp[i] = 1.0 + 2 * t[i]
             s += np.imag(states[k])
 
         out[i] = s
