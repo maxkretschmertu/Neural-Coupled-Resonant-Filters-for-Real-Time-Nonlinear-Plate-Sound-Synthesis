@@ -13,11 +13,15 @@ from .plate_solver import PlateEigenSolution
 class SampledModes:
     """FEM modes sampled onto the canonical Phase-2 material grid.
 
-    `mode_loss_mask` is one for ordinary stored targets.  If the fixed output
+    ``mode_loss_mask`` is one for ordinary stored targets. If the fixed output
     cutoff falls inside a near-degenerate eigenspace, all stored members of
-    that incomplete final group are set to zero in the mask.  The raw targets
+    that incomplete final group are set to zero in the mask. The raw targets
     are still stored for inspection, but Phase 4 can exclude those ambiguous
     channels from per-mode losses instead of rejecting symmetric geometries.
+
+    ``raw_grid_area_integral`` and ``raw_grid_area_relative_error`` retain the
+    unrenormalized material-grid quadrature diagnostic. The normalized weights
+    remain the actual modal inner-product weights.
     """
 
     modal_factors: np.ndarray
@@ -29,6 +33,8 @@ class SampledModes:
     mode_loss_mask: np.ndarray
     cutoff_group_complete: bool
     residuals: np.ndarray
+    raw_grid_area_integral: float
+    raw_grid_area_relative_error: float
 
     @property
     def n_modes(self) -> int:
@@ -77,9 +83,9 @@ def training_mode_mask(
     """Return a loss mask which handles a degenerate group crossing the cutoff.
 
     A fixed-size neural output cannot contain a complete eigenspace if mode N
-    is degenerate with mode N+1.  Rejecting such samples would systematically
-    remove exact symmetric shapes (e.g. square/circle).  Instead, mask the
-    stored members of that incomplete final group for per-mode training.  The
+    is degenerate with mode N+1. Rejecting such samples would systematically
+    remove exact symmetric shapes (e.g. square/circle). Instead, mask the
+    stored members of that incomplete final group for per-mode training. The
     complete group remains available among the extra solved eigenpairs for QA.
     """
     lam = np.asarray(solved_eigenvalues, dtype=np.float64)
@@ -95,7 +101,6 @@ def training_mode_mask(
     if gap > relative_gap:
         return mask, True
 
-    # Walk backwards over the complete stored portion of this final group.
     start = n_modes - 1
     while start > 0:
         previous_gap = abs(lam[start] - lam[start - 1]) / max(
@@ -124,7 +129,7 @@ def sample_modes_on_material_grid(
     grid = make_material_grid(geometry, grid_size)
     rho = np.asarray(grid.rho, dtype=np.float64)
     # Points exactly on the piecewise-linear Gmsh boundary can be classified
-    # outside by tiny inverse-map roundoff.  Simply-supported displacement is
+    # outside by tiny inverse-map roundoff. Simply-supported displacement is
     # zero at rho=1, so evaluate only strict interior points and set the edge 0.
     sample_mask = np.asarray(grid.mask, dtype=bool) & (rho < 1.0 - boundary_margin)
     points = np.column_stack(
@@ -165,4 +170,6 @@ def sample_modes_on_material_grid(
         mode_loss_mask=np.ascontiguousarray(loss_mask, dtype=np.float32),
         cutoff_group_complete=bool(cutoff_complete),
         residuals=np.ascontiguousarray(solution.residuals[:n_modes]),
+        raw_grid_area_integral=float(grid.raw_area_integral),
+        raw_grid_area_relative_error=float(grid.raw_area_relative_error),
     )
