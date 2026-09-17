@@ -17,6 +17,10 @@ class ReferenceMesh:
     min_edge_length: float
     mean_edge_length: float
     max_edge_length: float
+    target_area: float
+    mesh_area: float
+    relative_area_error: float
+    boundary_hausdorff_approx: float
 
     @property
     def n_vertices(self) -> int:
@@ -39,6 +43,90 @@ def _edge_statistics(points: np.ndarray, triangles: np.ndarray) -> tuple[float, 
     edges = np.unique(edges, axis=0)
     lengths = np.linalg.norm(points[edges[:, 0]] - points[edges[:, 1]], axis=1)
     return float(np.min(lengths)), float(np.mean(lengths)), float(np.max(lengths))
+
+
+def _boundary_edges(triangles: np.ndarray) -> np.ndarray:
+    edges = np.vstack(
+        (
+            triangles[:, [0, 1]],
+            triangles[:, [1, 2]],
+            triangles[:, [2, 0]],
+        )
+    )
+    edges = np.sort(edges, axis=1)
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary = unique[counts == 1]
+    if boundary.size == 0:
+        raise RuntimeError("mesh has no boundary edges")
+    return np.ascontiguousarray(boundary, dtype=np.int64)
+
+
+def _triangle_mesh_area(points: np.ndarray, triangles: np.ndarray) -> float:
+    a = points[triangles[:, 0]]
+    b = points[triangles[:, 1]]
+    c = points[triangles[:, 2]]
+    twice = np.abs(
+        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+        - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    )
+    return 0.5 * float(np.sum(twice))
+
+
+def _point_to_segments_min_distance(
+    query: np.ndarray,
+    seg_a: np.ndarray,
+    seg_b: np.ndarray,
+    *,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    """Distance from each query point to a piecewise-linear boundary."""
+    q = np.asarray(query, dtype=np.float64)
+    a = np.asarray(seg_a, dtype=np.float64)
+    b = np.asarray(seg_b, dtype=np.float64)
+    edge = b - a
+    edge2 = np.sum(edge * edge, axis=1)
+    result = np.empty(q.shape[0], dtype=np.float64)
+    for start in range(0, q.shape[0], chunk_size):
+        p = q[start : start + chunk_size]
+        pa = p[:, None, :] - a[None, :, :]
+        t = np.sum(pa * edge[None, :, :], axis=2) / np.maximum(edge2[None, :], 1e-30)
+        t = np.clip(t, 0.0, 1.0)
+        closest = a[None, :, :] + t[:, :, None] * edge[None, :, :]
+        d2 = np.sum((p[:, None, :] - closest) ** 2, axis=2)
+        result[start : start + p.shape[0]] = np.sqrt(np.min(d2, axis=1))
+    return result
+
+
+def _geometry_quality(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    target_boundary: np.ndarray,
+    target_area: float,
+) -> tuple[float, float, float]:
+    """Return mesh area, relative area error and symmetric boundary distance.
+
+    The Hausdorff value is a dense polyline approximation: all Phase-2 target
+    boundary points are measured against the Gmsh boundary segments, and mesh
+    boundary vertices plus edge midpoints are measured against the dense target
+    polyline. This catches both contour downsampling and mesher geometry drift.
+    """
+    mesh_area = _triangle_mesh_area(points, triangles)
+    rel_area = abs(mesh_area - target_area) / max(abs(target_area), 1e-30)
+
+    boundary_edges = _boundary_edges(triangles)
+    mesh_a = points[boundary_edges[:, 0]]
+    mesh_b = points[boundary_edges[:, 1]]
+    mesh_mid = 0.5 * (mesh_a + mesh_b)
+    mesh_queries = np.vstack((mesh_a, mesh_b, mesh_mid))
+
+    target = np.asarray(target_boundary, dtype=np.float64)
+    target_a = target
+    target_b = np.roll(target, -1, axis=0)
+
+    target_to_mesh = _point_to_segments_min_distance(target, mesh_a, mesh_b)
+    mesh_to_target = _point_to_segments_min_distance(mesh_queries, target_a, target_b)
+    hausdorff = max(float(np.max(target_to_mesh)), float(np.max(mesh_to_target)))
+    return mesh_area, rel_area, hausdorff
 
 
 def _orient_triangles_ccw(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
@@ -65,7 +153,7 @@ def _mesh_boundary_points(
 
     Phase-2 may use 720+ samples for an accurate SDF, but feeding every sample
     to Gmsh would force hundreds of tiny boundary edges irrespective of the
-    requested mesh size.  We resample by arc length while explicitly retaining
+    requested mesh size. We resample by arc length while explicitly retaining
     sharp corners detected from the dense polyline.
     """
     points = np.asarray(boundary, dtype=np.float64)
@@ -102,12 +190,7 @@ def mesh_geometry(
     *,
     gmsh_verbosity: int = 0,
 ) -> ReferenceMesh:
-    """Mesh a Phase-2 geometry using Gmsh.
-
-    Gmsh is initialized and finalized inside this function.  Dataset workers
-    therefore operate safely as independent processes; Gmsh is never called
-    concurrently from multiple threads in one process.
-    """
+    """Mesh a Phase-2 geometry using Gmsh and quantify approximation error."""
     if target_edge_length <= 0.0:
         raise ValueError("target_edge_length must be positive")
 
@@ -162,8 +245,6 @@ def mesh_geometry(
         if triangle_tags is None or triangle_tags.size == 0:
             raise RuntimeError("Gmsh did not produce first-order triangles")
 
-        # Gmsh node tags are arbitrary positive integers.  Convert to the row
-        # numbering of `coords` without assuming contiguous tags.
         sort_order = np.argsort(node_tags)
         sorted_tags = node_tags[sort_order]
         positions = np.searchsorted(sorted_tags, triangle_tags)
@@ -175,6 +256,12 @@ def mesh_geometry(
         triangles = _orient_triangles_ccw(coords, triangles)
 
         h_min, h_mean, h_max = _edge_statistics(coords, triangles)
+        mesh_area, rel_area, hausdorff = _geometry_quality(
+            coords,
+            triangles,
+            dense_boundary,
+            float(geometry.area),
+        )
         return ReferenceMesh(
             points=np.ascontiguousarray(coords, dtype=np.float64),
             triangles=np.ascontiguousarray(triangles, dtype=np.int32),
@@ -182,6 +269,10 @@ def mesh_geometry(
             min_edge_length=h_min,
             mean_edge_length=h_mean,
             max_edge_length=h_max,
+            target_area=float(geometry.area),
+            mesh_area=float(mesh_area),
+            relative_area_error=float(rel_area),
+            boundary_hausdorff_approx=float(hausdorff),
         )
     finally:
         gmsh.finalize()
