@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from math import ceil, log2, sqrt
 from pathlib import Path
@@ -20,7 +21,7 @@ from .validation import SampleQualityReport, validate_generated_sample
 
 @dataclass(frozen=True)
 class DatasetConfig:
-    version: str = "phase3-v1"
+    version: str = "phase3-v2"
     output_dir: str = "data/modal_dataset"
     seed: int = 20260917
     train_count: int = 8000
@@ -41,6 +42,12 @@ class DatasetConfig:
     max_residual: float = 1e-7
     max_mass_orthogonality_error: float = 1e-7
     max_grid_norm_error: float = 5e-5
+    max_modal_factor_relation_error: float = 1e-10
+    max_area_weight_error: float = 1e-8
+    max_inner_product_weight_error: float = 1e-8
+    max_raw_grid_area_relative_error: float = 0.03
+    max_mesh_area_relative_error: float = 5e-3
+    max_boundary_hausdorff: float = 1e-2
     shard_size: int = 250
     compression_level: int = 4
     workers: int = 0
@@ -54,8 +61,8 @@ class DatasetConfig:
     def validate(self) -> None:
         if min(self.train_count, self.val_count, self.test_count) < 0:
             raise ValueError("split counts must be non-negative")
-        if self.n_modes < 1 or self.n_solve < self.n_modes:
-            raise ValueError("require 1 <= n_modes <= n_solve")
+        if self.n_modes < 1 or self.n_solve <= self.n_modes:
+            raise ValueError("require 1 <= n_modes < n_solve (guard modes are mandatory)")
         if self.geometry_grid_size < 16 or self.mode_grid_size < 16:
             raise ValueError("geometry/mode grid size must be >= 16")
         if self.boundary_samples < 64:
@@ -70,12 +77,31 @@ class DatasetConfig:
             raise ValueError("invalid integration/eigensolver settings")
         if self.eigensolver_tolerance <= 0.0 or self.degeneracy_relative_gap < 0.0:
             raise ValueError("invalid eigensolver/degeneracy tolerance")
-        if min(
+        thresholds = (
             self.max_residual,
             self.max_mass_orthogonality_error,
             self.max_grid_norm_error,
-        ) <= 0.0:
-            raise ValueError("quality thresholds must be positive")
+            self.max_modal_factor_relation_error,
+            self.max_area_weight_error,
+            self.max_inner_product_weight_error,
+            self.max_raw_grid_area_relative_error,
+            self.max_mesh_area_relative_error,
+            self.max_boundary_hausdorff,
+        )
+        if min(thresholds) <= 0.0:
+            raise ValueError("all quality thresholds must be positive")
+
+    def fingerprint(self) -> str:
+        """Hash every setting that can change samples, split identity or schema.
+
+        Runtime-only controls (output path, worker count, compression and shard
+        size) are deliberately excluded so they can be changed when resuming.
+        """
+        payload = asdict(self)
+        for key in ("output_dir", "workers", "compression_level", "shard_size"):
+            payload.pop(key, None)
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -117,7 +143,6 @@ def _sobol_points(count: int, seed: int) -> np.ndarray:
 
 
 def _test_grid_points(count: int) -> np.ndarray:
-    """Deterministic interior grid reserved from random train/validation data."""
     if count <= 0:
         return np.empty((0, 2), dtype=np.float64)
     side = int(ceil(sqrt(count)))
@@ -126,29 +151,40 @@ def _test_grid_points(count: int) -> np.ndarray:
     return np.column_stack((m.ravel(), s.ravel()))[:count]
 
 
+def _point_keys(points: np.ndarray) -> set[tuple[float, float]]:
+    # Exact float64 values are deterministic here. Hex strings avoid accidental
+    # decimal rounding when enforcing strict split disjointness.
+    return {(float(x).hex(), float(y).hex()) for x, y in np.asarray(points)}
+
+
+def _assert_disjoint_splits(train: np.ndarray, val: np.ndarray, test: np.ndarray) -> None:
+    keyed = {"train": _point_keys(train), "val": _point_keys(val), "test": _point_keys(test)}
+    for name, points in keyed.items():
+        expected = {"train": len(train), "val": len(val), "test": len(test)}[name]
+        if len(points) != expected:
+            raise RuntimeError(f"duplicate geometry parameters inside {name} split")
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = keyed[a] & keyed[b]
+        if overlap:
+            raise RuntimeError(f"dataset split overlap detected between {a} and {b}: {len(overlap)} points")
+
+
 def build_sample_specs(config: DatasetConfig) -> list[SampleSpec]:
-    """Build a deterministic split before any expensive FEM work is run."""
+    """Build deterministic, strictly disjoint splits before any FEM work."""
     config.validate()
     train = _sobol_points(config.train_count, config.seed)
     val = _sobol_points(config.val_count, config.seed + 101)
     test = _test_grid_points(config.test_count)
 
-    # Ensure exact family endpoints and shape-mod extremes are represented in
-    # the training set without increasing its requested size.
     anchors = np.asarray(
-        [
-            (0.0, 0.0),
-            (0.0, 1.0),
-            (0.5, 0.0),
-            (0.5, 1.0),
-            (1.0, 0.0),
-            (1.0, 1.0),
-        ],
+        [(0.0, 0.0), (0.0, 1.0), (0.5, 0.0), (0.5, 1.0), (1.0, 0.0), (1.0, 1.0)],
         dtype=np.float64,
     )
     n_anchor = min(train.shape[0], anchors.shape[0])
     if n_anchor:
         train[:n_anchor] = anchors[:n_anchor]
+
+    _assert_disjoint_splits(train, val, test)
 
     specs: list[SampleSpec] = []
     for split, points in (("train", train), ("val", val), ("test", test)):
@@ -176,9 +212,7 @@ def _solver_config(config: DatasetConfig) -> PlateSolverConfig:
     )
 
 
-def _generate_one(
-    payload: tuple[DatasetConfig, SampleSpec],
-) -> GeneratedSample | FailedSample:
+def _generate_one(payload: tuple[DatasetConfig, SampleSpec]) -> GeneratedSample | FailedSample:
     config, spec = payload
     try:
         geometry = make_geometry(
@@ -199,9 +233,16 @@ def _generate_one(
         report = validate_generated_sample(
             solution,
             sampled,
+            mesh,
             max_residual=config.max_residual,
             max_mass_orthogonality_error=config.max_mass_orthogonality_error,
             max_grid_norm_error=config.max_grid_norm_error,
+            max_modal_factor_relation_error=config.max_modal_factor_relation_error,
+            max_area_weight_error=config.max_area_weight_error,
+            max_inner_product_weight_error=config.max_inner_product_weight_error,
+            max_raw_grid_area_relative_error=config.max_raw_grid_area_relative_error,
+            max_mesh_area_relative_error=config.max_mesh_area_relative_error,
+            max_boundary_hausdorff=config.max_boundary_hausdorff,
         )
         if not report.accepted:
             raise RuntimeError("; ".join(report.reasons))
@@ -214,7 +255,7 @@ def _generate_one(
             mesh=mesh,
             mass_orthogonality_error=float(solution.mass_orthogonality_error),
         )
-    except Exception as exc:  # keep batch generation alive; details go to JSONL
+    except Exception as exc:
         return FailedSample(
             spec=spec,
             error=f"{type(exc).__name__}: {exc}",
@@ -227,17 +268,14 @@ class _ShardWriter:
         self.root = root
         self.split = split
         self.config = config
+        self.fingerprint = config.fingerprint()
         self.root.mkdir(parents=True, exist_ok=True)
-        # Only finalized .h5 files participate in resume. A process crash may
-        # leave a .partial.h5; discard it instead of treating it as valid data.
         for partial in self.root.glob(f"{split}_*.partial.h5"):
             partial.unlink(missing_ok=True)
         existing = sorted(self.root.glob(f"{split}_*.h5"))
         self.next_index = 0
         if existing:
-            self.next_index = max(
-                int(path.stem.split("_")[-1]) for path in existing
-            ) + 1
+            self.next_index = max(int(path.stem.split("_")[-1]) for path in existing) + 1
         self._file = None
         self._final_path: Path | None = None
         self._partial_path: Path | None = None
@@ -249,34 +287,25 @@ class _ShardWriter:
             import h5py
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("HDF5 output requires h5py") from exc
-
         final_path = self.root / f"{self.split}_{self.next_index:05d}.h5"
         partial_path = self.root / f"{self.split}_{self.next_index:05d}.partial.h5"
         self.next_index += 1
         f = h5py.File(partial_path, "w")
         f.attrs["dataset_version"] = self.config.version
+        f.attrs["config_fingerprint"] = self.fingerprint
         f.attrs["split"] = self.split
         f.attrs["boundary_condition"] = self.config.boundary_condition
         f.attrs["poisson_ratio"] = self.config.poisson_ratio
         f.attrs["n_modes"] = self.config.n_modes
         f.attrs["n_solve"] = self.config.n_solve
-        f.attrs["modal_factor_convention"] = (
-            "sqrt(kirchhoff_dimensionless_eigenvalue)"
-        )
+        f.attrs["modal_factor_convention"] = "sqrt(kirchhoff_dimensionless_eigenvalue)"
         self._file = f
         self._final_path = final_path
         self._partial_path = partial_path
         self._datasets = {}
         self._count = 0
 
-    def _dataset(
-        self,
-        name: str,
-        sample_shape: tuple[int, ...],
-        dtype: Any,
-        *,
-        compress: bool = True,
-    ):
+    def _dataset(self, name: str, sample_shape: tuple[int, ...], dtype: Any, *, compress: bool = True):
         if name in self._datasets:
             return self._datasets[name]
         assert self._file is not None
@@ -287,11 +316,7 @@ class _ShardWriter:
             "dtype": dtype,
         }
         if compress and sample_shape:
-            kwargs.update(
-                compression="gzip",
-                compression_opts=int(self.config.compression_level),
-                shuffle=True,
-            )
+            kwargs.update(compression="gzip", compression_opts=int(self.config.compression_level), shuffle=True)
         ds = self._file.create_dataset(name, **kwargs)
         self._datasets[name] = ds
         return ds
@@ -310,47 +335,32 @@ class _ShardWriter:
     def append(self, sample: GeneratedSample) -> None:
         if self._file is None:
             self._open()
-        sampled = sample.sampled
+        s = sample.sampled
         self._append_scalar("sample_id", sample.spec.sample_id, "S32")
         self._append_scalar("morph", sample.spec.morph, np.float32)
         self._append_scalar("shape_mod", sample.spec.shape_mod, np.float32)
         self._append_array("sdf", sample.sdf, np.float32)
         self._append_array("mask", sample.mask, np.uint8)
-        self._append_array("modal_factors", sampled.modal_factors, np.float32)
-        self._append_array("eigenvalues", sampled.eigenvalues, np.float64)
-        self._append_array("mode_shapes", sampled.mode_shapes, np.float32)
-        self._append_array("area_weights", sampled.area_weights, np.float32)
-        self._append_array(
-            "inner_product_weights", sampled.inner_product_weights, np.float32
-        )
-        self._append_array(
-            "degenerate_group_id", sampled.degenerate_group_id, np.int16
-        )
-        self._append_array("mode_loss_mask", sampled.mode_loss_mask, np.float32)
-        self._append_scalar(
-            "cutoff_group_complete", int(sampled.cutoff_group_complete), np.uint8
-        )
-        self._append_array(
-            "eigensolver_residual", sampled.residuals, np.float64
-        )
-        self._append_scalar(
-            "mass_orthogonality_error",
-            sample.mass_orthogonality_error,
-            np.float64,
-        )
+        self._append_array("modal_factors", s.modal_factors, np.float32)
+        self._append_array("eigenvalues", s.eigenvalues, np.float64)
+        self._append_array("mode_shapes", s.mode_shapes, np.float32)
+        self._append_array("area_weights", s.area_weights, np.float32)
+        self._append_array("inner_product_weights", s.inner_product_weights, np.float32)
+        self._append_array("degenerate_group_id", s.degenerate_group_id, np.int16)
+        self._append_array("mode_loss_mask", s.mode_loss_mask, np.float32)
+        self._append_scalar("cutoff_group_complete", int(s.cutoff_group_complete), np.uint8)
+        self._append_array("eigensolver_residual", s.residuals, np.float64)
+        self._append_scalar("mass_orthogonality_error", sample.mass_orthogonality_error, np.float64)
+        self._append_scalar("raw_grid_area_integral", s.raw_grid_area_integral, np.float64)
+        self._append_scalar("raw_grid_area_relative_error", s.raw_grid_area_relative_error, np.float64)
         self._append_scalar("mesh_n_vertices", sample.mesh.n_vertices, np.int32)
-        self._append_scalar(
-            "mesh_n_triangles", sample.mesh.n_triangles, np.int32
-        )
-        self._append_scalar(
-            "mesh_h_min", sample.mesh.min_edge_length, np.float32
-        )
-        self._append_scalar(
-            "mesh_h_mean", sample.mesh.mean_edge_length, np.float32
-        )
-        self._append_scalar(
-            "mesh_h_max", sample.mesh.max_edge_length, np.float32
-        )
+        self._append_scalar("mesh_n_triangles", sample.mesh.n_triangles, np.int32)
+        self._append_scalar("mesh_h_min", sample.mesh.min_edge_length, np.float32)
+        self._append_scalar("mesh_h_mean", sample.mesh.mean_edge_length, np.float32)
+        self._append_scalar("mesh_h_max", sample.mesh.max_edge_length, np.float32)
+        self._append_scalar("mesh_area", sample.mesh.mesh_area, np.float64)
+        self._append_scalar("mesh_relative_area_error", sample.mesh.relative_area_error, np.float64)
+        self._append_scalar("mesh_boundary_hausdorff_approx", sample.mesh.boundary_hausdorff_approx, np.float64)
 
         if self.config.store_mesh:
             try:
@@ -364,10 +374,7 @@ class _ShardWriter:
                 if name not in self._datasets:
                     assert self._file is not None
                     self._datasets[name] = self._file.create_dataset(
-                        name,
-                        shape=(0,),
-                        maxshape=(None,),
-                        dtype=h5py.vlen_dtype(np.dtype(dtype)),
+                        name, shape=(0,), maxshape=(None,), dtype=h5py.vlen_dtype(np.dtype(dtype))
                     )
                 ds = self._datasets[name]
                 ds.resize(self._count + 1, axis=0)
@@ -390,7 +397,41 @@ class _ShardWriter:
         self._count = 0
 
 
-def _completed_ids(root: Path) -> set[str]:
+def _validate_resume_compatibility(root: Path, config: DatasetConfig) -> None:
+    """Refuse to mix samples produced by a different numerical contract."""
+    fingerprint = config.fingerprint()
+    manifest = root / "manifest.json"
+    if manifest.exists():
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        old = payload.get("config_fingerprint")
+        if old is None:
+            raise RuntimeError(
+                "existing dataset manifest predates config fingerprints; use a new output_dir or delete the old dataset"
+            )
+        if old != fingerprint:
+            raise RuntimeError(
+                "dataset config fingerprint mismatch; refusing to mix labels from different solver/config settings"
+            )
+
+    try:
+        import h5py
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("resume scanning requires h5py") from exc
+    for path in sorted(root.glob("*_*.h5")):
+        if path.name.endswith(".partial.h5"):
+            continue
+        with h5py.File(path, "r") as f:
+            stored = f.attrs.get("config_fingerprint")
+            if isinstance(stored, bytes):
+                stored = stored.decode("utf-8")
+            if stored != fingerprint:
+                raise RuntimeError(
+                    f"incompatible existing shard {path.name}: config fingerprint mismatch"
+                )
+
+
+def _completed_ids(root: Path, config: DatasetConfig) -> set[str]:
+    _validate_resume_compatibility(root, config)
     try:
         import h5py
     except ImportError as exc:  # pragma: no cover
@@ -401,27 +442,26 @@ def _completed_ids(root: Path) -> set[str]:
             continue
         with h5py.File(path, "r") as f:
             if "sample_id" not in f:
-                continue
+                raise RuntimeError(f"finalized shard {path.name} has no sample_id dataset")
             for raw in f["sample_id"][:]:
-                done.add(
-                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-                )
+                sample_id = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                if sample_id in done:
+                    raise RuntimeError(f"duplicate sample_id across finalized shards: {sample_id}")
+                done.add(sample_id)
     return done
 
 
-def _write_manifest(
-    root: Path,
-    config: DatasetConfig,
-    extra: dict[str, Any],
-) -> None:
+def _write_manifest(root: Path, config: DatasetConfig, extra: dict[str, Any]) -> None:
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "config_fingerprint": config.fingerprint(),
         "config": asdict(config),
         **extra,
     }
-    (root / "manifest.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    temp = root / "manifest.partial.json"
+    final = root / "manifest.json"
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temp.replace(final)
 
 
 def generate_dataset(
@@ -438,40 +478,29 @@ def generate_dataset(
     specs = build_sample_specs(config)
     if limit is not None:
         specs = specs[: max(int(limit), 0)]
-    completed = _completed_ids(root)
+    completed = _completed_ids(root, config)
     pending = [spec for spec in specs if spec.sample_id not in completed]
 
-    writers = {
-        split: _ShardWriter(root, split, config)
-        for split in ("train", "val", "test")
-    }
+    writers = {split: _ShardWriter(root, split, config) for split in ("train", "val", "test")}
     failed_path = root / "failed_samples.jsonl"
-    counts = {
-        "written": 0,
-        "failed": 0,
-        "skipped": len(specs) - len(pending),
-    }
+    counts = {"written": 0, "failed": 0, "skipped": len(specs) - len(pending)}
 
     requested_workers = config.workers if workers is None else workers
     if requested_workers is None or requested_workers <= 0:
         import os
-
         requested_workers = max(1, (os.cpu_count() or 2) - 1)
 
     _write_manifest(
         root,
         config,
-        {
-            "status": "running",
-            "requested_samples": len(specs),
-            "remaining_at_start": len(pending),
-        },
+        {"status": "running", "requested_samples": len(specs), "remaining_at_start": len(pending)},
     )
 
     def consume(result: GeneratedSample | FailedSample) -> None:
         if isinstance(result, FailedSample):
             counts["failed"] += 1
             record = {
+                "config_fingerprint": config.fingerprint(),
                 "sample_id": result.spec.sample_id,
                 "split": result.spec.split,
                 "morph": result.spec.morph,
@@ -491,9 +520,7 @@ def generate_dataset(
                 consume(_generate_one((config, spec)))
         else:
             with ProcessPoolExecutor(max_workers=requested_workers) as pool:
-                futures = [
-                    pool.submit(_generate_one, (config, spec)) for spec in pending
-                ]
+                futures = [pool.submit(_generate_one, (config, spec)) for spec in pending]
                 for future in as_completed(futures):
                     consume(future.result())
     finally:
@@ -504,10 +531,6 @@ def generate_dataset(
     _write_manifest(
         root,
         config,
-        {
-            "status": final_status,
-            "requested_samples": len(specs),
-            **counts,
-        },
+        {"status": final_status, "requested_samples": len(specs), **counts},
     )
     return counts
