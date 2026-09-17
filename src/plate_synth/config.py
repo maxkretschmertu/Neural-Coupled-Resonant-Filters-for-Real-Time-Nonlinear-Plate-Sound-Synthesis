@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 
+SUPPORTED_BOUNDARY_CONDITIONS = ("simply_supported",)
+
+
 @dataclass(frozen=True)
 class SynthParameters:
     """Immutable control state for the neural modal plate synthesizer."""
@@ -15,6 +18,11 @@ class SynthParameters:
     morph: float = 0.0
     shape_mod: float = 0.0
     size_m: float = 1.0
+
+    # Boundary condition is part of the modal-model / dataset contract.
+    # Phase 2 deliberately supports one condition only; Phase 3 labels must
+    # use the same convention.
+    boundary_condition: str = "simply_supported"
 
     flexural_rigidity: float = 18_300.0
     density: float = 7_800.0
