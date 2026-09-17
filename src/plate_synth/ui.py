@@ -2,190 +2,178 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
+import numpy as np
 
 from .audio_engine import AudioEngine
+from .material_coordinates import material_to_physical, physical_to_material
 
 
 class SynthUI:
-    """Phase-1 UI. Geometry is still rectangular; backend internals stay hidden."""
-
-    CANVAS_SIZE = 320
-    DEBOUNCE_MS = 60
+    CANVAS_SIZE = 420
+    DEBOUNCE_MS = 50
 
     def __init__(self, root: tk.Tk, engine: AudioEngine) -> None:
         self.root = root
         self.engine = engine
-        self.root.title("Plate Resonator Synth - Phase 1")
-        self._pending_update_id: str | None = None
+        self.root.title("Neural Modal Plate Synth - Geometry Phase")
         self._queued_changes: dict[str, object] = {}
+        self._pending_update_id: str | None = None
         self._drag_target = tk.StringVar(value="strike")
-        self._build_layout()
-        self._draw_plate_and_points()
-        self._poll_status()
+        self._build()
+        self._draw_geometry()
+        self._poll()
 
-    def _build_layout(self) -> None:
-        container = ttk.Frame(self.root, padding=10)
-        container.pack(fill="both", expand=True)
-        left = ttk.Frame(container)
-        right = ttk.Frame(container)
+    def _build(self) -> None:
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
+        left = ttk.Frame(outer)
+        right = ttk.Frame(outer)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         right.grid(row=0, column=1, sticky="ns")
-        container.columnconfigure(0, weight=1)
 
-        ttk.Label(left, text="Plate / spatial controls", font=("", 11, "bold")).pack(anchor="w")
-        self.canvas = tk.Canvas(
-            left,
-            width=self.CANVAS_SIZE,
-            height=self.CANVAS_SIZE,
-            bg="white",
-            highlightthickness=1,
-            highlightbackground="#888",
-        )
+        ttk.Label(left, text="Plate geometry / material positions", font=("", 11, "bold")).pack(anchor="w")
+        self.canvas = tk.Canvas(left, width=self.CANVAS_SIZE, height=self.CANVAS_SIZE, bg="white")
         self.canvas.pack(pady=6)
-        self.canvas.bind("<Button-1>", self._on_canvas_drag)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-
-        target = ttk.Frame(left)
-        target.pack(anchor="w")
-        ttk.Label(target, text="Drag:").pack(side="left")
-        ttk.Radiobutton(target, text="Strike", value="strike", variable=self._drag_target).pack(side="left", padx=6)
-        ttk.Radiobutton(target, text="Pickup", value="pickup", variable=self._drag_target).pack(side="left")
-
-        buttons = ttk.Frame(left)
-        buttons.pack(anchor="w", pady=(8, 0))
-        ttk.Button(buttons, text="Strike", command=self.engine.strike).pack(side="left")
-        ttk.Button(buttons, text="Clear", command=self.engine.clear).pack(side="left", padx=6)
+        self.canvas.bind("<Button-1>", self._on_drag)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        row = ttk.Frame(left)
+        row.pack(anchor="w")
+        ttk.Radiobutton(row, text="Strike", value="strike", variable=self._drag_target).pack(side="left")
+        ttk.Radiobutton(row, text="Pickup", value="pickup", variable=self._drag_target).pack(side="left", padx=8)
+        ttk.Button(row, text="Strike", command=self.engine.strike).pack(side="left", padx=(16, 4))
+        ttk.Button(row, text="Clear", command=self.engine.clear).pack(side="left")
 
         self.pickup_enabled = tk.BooleanVar(value=self.engine.params.pickup_enabled)
         ttk.Checkbutton(
             left,
-            text="Spatial pickup (off = v12 equal-weight readout)",
+            text="Spatial pickup",
             variable=self.pickup_enabled,
-            command=lambda: self._queue_update(pickup_enabled=bool(self.pickup_enabled.get())),
-        ).pack(anchor="w", pady=(8, 0))
+            command=lambda: self._queue(pickup_enabled=self.pickup_enabled.get()),
+        ).pack(anchor="w", pady=6)
 
-        ttk.Label(right, text="Geometry / tuning", font=("", 11, "bold")).pack(anchor="w")
-        self._add_slider(right, "Lx [m]", 0.05, 2.0, "length_x_m")
-        self._add_slider(right, "Ly [m]", 0.05, 2.0, "length_y_m")
-        self._add_int_slider(right, "Number of modes", 1, 128, "n_modes")
-        self._add_slider(right, "Frequency scale", 0.25, 4.0, "frequency_scale")
+        self._section(right, "GEOMETRY")
+        self._slider(right, "Morph   Rectangle → Ellipse → Triangle", 0.0, 1.0, self.engine.params.morph, "morph")
+        self._slider(right, "Shape Mod   compact → slender", 0.0, 1.0, self.engine.params.shape_mod, "shape_mod")
+        self._slider(right, "Size √area [m]", 0.1, 2.0, self.engine.params.size_m, "size_m")
+        self._int_slider(right, "Number of modes", 4, 64, self.engine.params.n_modes, "n_modes")
 
-        ttk.Separator(right).pack(fill="x", pady=8)
-        ttk.Label(right, text="Material / damping", font=("", 11, "bold")).pack(anchor="w")
-        self._add_slider(right, "D [N m]", 100.0, 40_000.0, "flexural_rigidity")
-        self._add_slider(right, "rho [kg/m3]", 500.0, 12_000.0, "density")
-        self._add_slider(right, "H [m]", 0.001, 0.05, "thickness_m")
-        self._add_slider(right, "alpha_g", 0.001, 5.0, "alpha_g")
-        self._add_slider(right, "alpha_r", 0.0, 2e-4, "alpha_r")
+        self._section(right, "MATERIAL / DAMPING")
+        self._slider(right, "Flexural rigidity D", 1000.0, 40000.0, self.engine.params.flexural_rigidity, "flexural_rigidity")
+        self._slider(right, "Density ρ", 500.0, 10000.0, self.engine.params.density, "density")
+        self._slider(right, "Thickness H [m]", 0.001, 0.05, self.engine.params.thickness_m, "thickness_m")
+        self._slider(right, "alpha_g", 0.001, 5.0, self.engine.params.alpha_g, "alpha_g")
+        self._slider(right, "alpha_r", 0.0, 2e-4, self.engine.params.alpha_r, "alpha_r")
 
-        ttk.Separator(right).pack(fill="x", pady=8)
-        ttk.Label(right, text="Excitation / nonlinearity", font=("", 11, "bold")).pack(anchor="w")
-        self._add_int_slider(right, "Excitation length [samples]", 2, 512, "excitation_length_samples")
-        self._add_slider(right, "tau", 0.0, 2.0, "tau")
-        self._add_slider(right, "eta", 0.0, 0.10, "eta")
-        self._add_slider(right, "lambda", 0.0, 0.10, "lamb")
+        self._section(right, "TUNING / NONLINEAR")
+        self._slider(right, "Frequency scale", 0.25, 4.0, self.engine.params.frequency_scale, "frequency_scale")
+        self._slider(right, "tau", 0.0, 2.0, self.engine.params.tau, "tau")
+        self._slider(right, "eta", 0.0, 0.1, self.engine.params.eta, "eta")
+        self._slider(right, "lambda", 0.0, 0.1, self.engine.params.lamb, "lamb")
+        self.status = ttk.Label(right, text="", wraplength=320)
+        self.status.pack(anchor="w", pady=(10, 0))
 
-        self.status_label = ttk.Label(right, text="")
-        self.status_label.pack(anchor="w", pady=(8, 0))
+    @staticmethod
+    def _section(parent, text: str) -> None:
+        ttk.Separator(parent).pack(fill="x", pady=(8, 4))
+        ttk.Label(parent, text=text, font=("", 10, "bold")).pack(anchor="w")
 
-    def _add_slider(self, parent, label: str, start: float, end: float, field: str) -> None:
+    def _slider(self, parent, label, low, high, value, name) -> None:
         frame = ttk.Frame(parent)
-        frame.pack(fill="x", pady=(4, 0))
-        value = float(getattr(self.engine.params, field))
-        variable = tk.DoubleVar(value=value)
-        value_label = ttk.Label(frame, text=f"{value:.4g}")
+        frame.pack(fill="x", pady=2)
         ttk.Label(frame, text=label).pack(anchor="w")
-
-        def changed(raw: str) -> None:
-            v = float(raw)
-            value_label.configure(text=f"{v:.4g}")
-            self._queue_update(**{field: v})
-
-        ttk.Scale(frame, from_=start, to=end, variable=variable, command=changed).pack(fill="x")
+        var = tk.DoubleVar(value=value)
+        value_label = ttk.Label(frame, text=f"{value:.4g}")
+        ttk.Scale(
+            frame,
+            from_=low,
+            to=high,
+            variable=var,
+            command=lambda raw: (
+                value_label.configure(text=f"{float(raw):.4g}"),
+                self._queue(**{name: float(raw)}),
+            ),
+        ).pack(fill="x")
         value_label.pack(anchor="e")
 
-    def _add_int_slider(self, parent, label: str, start: int, end: int, field: str) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill="x", pady=(4, 0))
-        ttk.Label(frame, text=label).pack(anchor="w")
-        variable = tk.IntVar(value=int(getattr(self.engine.params, field)))
-        tk.Scale(
-            frame,
-            from_=start,
-            to=end,
+    def _int_slider(self, parent, label, low, high, value, name) -> None:
+        ttk.Label(parent, text=label).pack(anchor="w")
+        scale = tk.Scale(
+            parent,
+            from_=low,
+            to=high,
             orient="horizontal",
             resolution=1,
-            variable=variable,
-            command=lambda raw: self._queue_update(**{field: int(float(raw))}),
-        ).pack(fill="x")
+            command=lambda raw: self._queue(**{name: int(float(raw))}),
+        )
+        scale.set(value)
+        scale.pack(fill="x")
 
-    def _queue_update(self, **changes: object) -> None:
+    def _queue(self, **changes: object) -> None:
         self._queued_changes.update(changes)
         if self._pending_update_id is not None:
             self.root.after_cancel(self._pending_update_id)
-        self._pending_update_id = self.root.after(self.DEBOUNCE_MS, self._flush_updates)
+        self._pending_update_id = self.root.after(self.DEBOUNCE_MS, self._flush)
 
-    def _flush_updates(self) -> None:
+    def _flush(self) -> None:
         self._pending_update_id = None
-        changes = self._queued_changes
-        self._queued_changes = {}
+        changes, self._queued_changes = self._queued_changes, {}
         if changes:
             self.engine.update_parameters(**changes)
-            self._draw_plate_and_points()
+            self._draw_geometry()
 
-    def _plate_bounds(self) -> tuple[float, float, float, float]:
-        p = self.engine.params
-        margin = 28.0
-        available = self.CANVAS_SIZE - 2.0 * margin
-        aspect = p.length_x_m / p.length_y_m
-        if aspect >= 1.0:
-            width, height = available, available / aspect
-        else:
-            width, height = available * aspect, available
-        cx = cy = self.CANVAS_SIZE * 0.5
-        return cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2
+    def _bounds(self):
+        xy = self.engine.current_geometry.boundary_xy
+        max_abs = max(float(np.max(np.abs(xy))), 1e-9)
+        margin = 30.0
+        return (self.CANVAS_SIZE / 2 - margin) / max_abs
 
-    def _normalized_to_canvas(self, x: float, y: float) -> tuple[float, float]:
-        x0, y0, x1, y1 = self._plate_bounds()
-        return x0 + x * (x1 - x0), y1 - y * (y1 - y0)
+    def _physical_to_canvas(self, x, y):
+        scale = self._bounds()
+        c = self.CANVAS_SIZE / 2
+        return c + np.asarray(x) * scale, c - np.asarray(y) * scale
 
-    def _canvas_to_normalized(self, px: float, py: float) -> tuple[float, float]:
-        x0, y0, x1, y1 = self._plate_bounds()
-        x = (px - x0) / max(x1 - x0, 1e-12)
-        y = (y1 - py) / max(y1 - y0, 1e-12)
-        return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+    def _canvas_to_physical(self, px, py):
+        scale = self._bounds()
+        c = self.CANVAS_SIZE / 2
+        return (px - c) / scale, (c - py) / scale
 
-    def _draw_plate_and_points(self) -> None:
+    def _draw_geometry(self) -> None:
         self.canvas.delete("all")
-        x0, y0, x1, y1 = self._plate_bounds()
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#d8e7f3", outline="#222", width=2)
+        g = self.engine.current_geometry
+        x, y = self._physical_to_canvas(g.boundary_xy[:, 0], g.boundary_xy[:, 1])
+        coords = np.column_stack((x, y)).ravel().tolist()
+        self.canvas.create_polygon(*coords, fill="#dbe8f4", outline="#222", width=2)
         p = self.engine.params
-        for label, x, y, fill in (
-            ("S", p.strike_x, p.strike_y, "#d62728"),
-            ("P", p.pickup_x, p.pickup_y, "#2ca02c"),
+        for u, v, fill, label in (
+            (p.strike_u, p.strike_v, "#d62728", "S"),
+            (p.pickup_u, p.pickup_v, "#2ca02c", "P"),
         ):
-            px, py = self._normalized_to_canvas(x, y)
+            px0, py0 = material_to_physical(g, u, v)
+            cx, cy = self._physical_to_canvas(float(px0), float(py0))
             r = 6
-            self.canvas.create_oval(px-r, py-r, px+r, py+r, fill=fill, outline="")
-            self.canvas.create_text(px+10, py-10, text=label, anchor="sw")
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=fill, outline="")
+            self.canvas.create_text(cx+10, cy-8, text=label)
 
-    def _on_canvas_drag(self, event) -> None:
-        x, y = self._canvas_to_normalized(event.x, event.y)
+    def _on_drag(self, event) -> None:
+        x, y = self._canvas_to_physical(event.x, event.y)
+        u, v = physical_to_material(self.engine.current_geometry, x, y)
         if self._drag_target.get() == "pickup":
-            self._queue_update(pickup_x=x, pickup_y=y)
+            self._queue(pickup_u=float(u), pickup_v=float(v))
         else:
-            self._queue_update(strike_x=x, strike_y=y)
+            self._queue(strike_u=float(u), strike_v=float(v))
 
-    def _poll_status(self) -> None:
+    def _poll(self) -> None:
         freqs = self.engine.current_frequencies_hz
-        if len(freqs):
-            summary = f"Modes: {len(freqs)}\nf min/max: {freqs.min():.1f} / {freqs.max():.1f} Hz"
-        else:
-            summary = "Modes: 0"
+        g = self.engine.current_geometry
+        text = (
+            f"Geometry: morph={g.morph:.3f}, shape={g.shape_mod:.3f}, area={g.area:.5f}\n"
+            f"Audio modes: {len(freqs)} | f={freqs.min():.1f}…{freqs.max():.1f} Hz\n"
+            f"Modal status: {self.engine.model_status}"
+        )
         if self.engine.last_status:
-            summary += f"\nAudio status: {self.engine.last_status}"
-        self.status_label.configure(text=summary)
-        self.root.after(250, self._poll_status)
+            text += f"\nAudio: {self.engine.last_status}"
+        self.status.configure(text=text)
+        self.root.after(250, self._poll)
 
 
 def run_ui() -> None:
@@ -193,10 +181,10 @@ def run_ui() -> None:
     engine = AudioEngine()
     SynthUI(root, engine)
 
-    def on_close() -> None:
+    def close() -> None:
         engine.stop()
         root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.protocol("WM_DELETE_WINDOW", close)
     engine.start()
     root.mainloop()

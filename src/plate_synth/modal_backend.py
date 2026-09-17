@@ -1,149 +1,120 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil, sqrt
 from typing import Protocol
-
 import numpy as np
 
 from .config import SynthParameters
 from .geometry import GeometryDescription
-from .spatial import analytical_rectangle_weights, bilinear_sample_mode_maps
+from .material_coordinates import make_material_grid
+from .spatial import bilinear_sample_mode_maps
+
+
+class UnsupportedGeometryError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
 class ModalBasis:
-    """Geometry-dependent modal data produced by a modal backend.
+    """Geometry-dependent, material-independent modal basis.
 
-    Crucially, this object contains no material-scaled frequencies. A future
-    neural backend therefore only has to predict geometry-dependent modal
-    factors and mode shapes. Physical size, material, damping and tuning are
-    resolved afterwards by ordinary code.
+    modal_factors follow
+        omega_k = modal_factor_k * sqrt(D/(rho*H)) / size_m^2
+    before the user frequency-scale control.
     """
 
     modal_factors: np.ndarray
     mode_shapes: np.ndarray
-    geometry_sdf: np.ndarray
     integration_weights: np.ndarray
-    legacy_mode_indices: np.ndarray | None = None
+    geometry: GeometryDescription
 
     @property
     def n_modes(self) -> int:
         return int(self.modal_factors.shape[0])
 
-    def sample_weights(self, x: float, y: float) -> np.ndarray:
-        if self.legacy_mode_indices is not None:
-            return analytical_rectangle_weights(self.legacy_mode_indices, x, y)
-        return bilinear_sample_mode_maps(self.mode_shapes, x, y)
+    def sample_weights(self, u: float, v: float) -> np.ndarray:
+        return bilinear_sample_mode_maps(self.mode_shapes, u, v)
 
 
 class ModalBackend(Protocol):
-    """Geometry-only modal predictor contract used by analytical and NN backends."""
-
     def predict(self, geometry: GeometryDescription, n_modes: int) -> ModalBasis:
         ...
 
 
-class LegacyRectangleBackend:
-    """Rectangle reference backend preserving the historical v12 ordering.
+class AnalyticRectangleBackend:
+    """Simply-supported rectangle backend used until the NN is trained.
 
-    For n_modes=90 the generated pairs are exactly the old order=10 list.
-    Other counts use the smallest legacy rectangular enumeration large enough
-    to supply the requested number of modes, then truncate it.
+    It is not a compatibility layer. Modes are sorted by increasing physical
+    modal factor and use the rectangular Kirchhoff-plate expression on the
+    unit-area canonical domain. Non-rectangle geometries are rejected rather
+    than approximated with fake modes.
     """
 
-    def __init__(self, shape_grid_size: int = 64) -> None:
-        if shape_grid_size < 8:
-            raise ValueError("shape_grid_size must be >= 8")
-        self.shape_grid_size = int(shape_grid_size)
+    def __init__(self, mode_grid_size: int = 64) -> None:
+        if mode_grid_size < 16:
+            raise ValueError("mode_grid_size must be >= 16")
+        self.mode_grid_size = int(mode_grid_size)
 
     @staticmethod
-    def legacy_mode_indices(n_modes: int) -> np.ndarray:
-        if n_modes < 1:
-            raise ValueError("n_modes must be >= 1")
-        order = max(2, int(ceil((1.0 + sqrt(1.0 + 4.0 * n_modes)) / 2.0)))
-        pairs = [(m, n) for m in range(1, order + 1) for n in range(1, order)]
-        return np.asarray(pairs[:n_modes], dtype=np.int64).reshape(-1, 2)
+    def _is_rectangle_endpoint(geometry: GeometryDescription) -> bool:
+        return abs(float(geometry.morph)) <= 1e-12
 
-    def _mode_shape_maps(
-        self,
-        mode_indices: np.ndarray,
-        geometry: GeometryDescription,
-    ) -> np.ndarray:
-        """Evaluate rectangle modes on the same canonical grid as the SDF."""
-        n = geometry.grid_size
-        aspect = geometry.aspect_ratio
-        if aspect >= 1.0:
-            half_x = 0.9
-            half_y = 0.9 / aspect
-        else:
-            half_x = 0.9 * aspect
-            half_y = 0.9
-
-        axis = np.linspace(-1.0, 1.0, n, dtype=np.float64)
-        x, y = np.meshgrid(axis, axis, indexing="xy")
-        u = (x / half_x + 1.0) * 0.5
-        v = (y / half_y + 1.0) * 0.5
-        inside = geometry.sdf <= 0.0
-
-        shapes = np.zeros((mode_indices.shape[0], n, n), dtype=np.float64)
-        for k, (l, m) in enumerate(mode_indices):
-            values = np.sin(l * np.pi * u) * np.sin(m * np.pi * v)
-            shapes[k, inside] = values[inside]
-        return np.ascontiguousarray(shapes)
+    @staticmethod
+    def _aspect(shape_mod: float, max_stretch: float = 4.0) -> float:
+        return float(np.exp(np.log(max_stretch) * np.clip(shape_mod, 0.0, 1.0)))
 
     def predict(self, geometry: GeometryDescription, n_modes: int) -> ModalBasis:
-        if geometry.kind != "rectangle":
-            raise ValueError("LegacyRectangleBackend only supports rectangles")
+        if not self._is_rectangle_endpoint(geometry):
+            raise UnsupportedGeometryError(
+                "No trained neural modal backend is available for morphed/circle/triangle geometries yet."
+            )
+        if n_modes < 1:
+            raise ValueError("n_modes must be >= 1")
 
-        indices = self.legacy_mode_indices(n_modes)
-        l = indices[:, 0].astype(np.float64)
-        m = indices[:, 1].astype(np.float64)
+        aspect = self._aspect(geometry.shape_mod)
+        lx = np.sqrt(aspect)
+        ly = 1.0 / np.sqrt(aspect)
 
-        # Exact geometry-dependent factor used by v12. Material and absolute
-        # scale are deliberately not applied here.
-        factors = l**2 + geometry.aspect_ratio * m**2
-        shapes = self._mode_shape_maps(indices, geometry)
+        order = max(4, int(np.ceil(np.sqrt(n_modes))) + 3)
+        while order * order < n_modes:
+            order += 1
+        candidates: list[tuple[float, int, int]] = []
+        for m in range(1, order + 1):
+            for n in range(1, order + 1):
+                factor = np.pi**2 * (m * m / (lx * lx) + n * n / (ly * ly))
+                candidates.append((float(factor), m, n))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        selected = candidates[:n_modes]
+        factors = np.asarray([item[0] for item in selected], dtype=np.float64)
 
-        inside = (geometry.sdf <= 0.0).astype(np.float64)
-        total = float(np.sum(inside))
-        weights = inside / total if total > 0.0 else inside
+        grid = make_material_grid(geometry, self.mode_grid_size)
+        x = grid.physical_x
+        y = grid.physical_y
+        xi = x / lx + 0.5
+        eta = y / ly + 0.5
+        shapes = np.zeros((n_modes, self.mode_grid_size, self.mode_grid_size), dtype=np.float64)
+        for k, (_, m, n) in enumerate(selected):
+            values = np.sin(m * np.pi * xi) * np.sin(n * np.pi * eta)
+            values = np.where(grid.mask, values, 0.0)
+            norm = np.sqrt(np.sum(grid.integration_weights * values * values))
+            if norm > 1e-12:
+                values /= norm
+            shapes[k] = values
 
         return ModalBasis(
-            modal_factors=np.ascontiguousarray(factors, dtype=np.float64),
-            mode_shapes=shapes,
-            geometry_sdf=np.ascontiguousarray(geometry.sdf, dtype=np.float64),
-            integration_weights=np.ascontiguousarray(weights, dtype=np.float64),
-            legacy_mode_indices=indices,
+            modal_factors=np.ascontiguousarray(factors),
+            mode_shapes=np.ascontiguousarray(shapes),
+            integration_weights=np.ascontiguousarray(grid.integration_weights),
+            geometry=geometry,
         )
 
 
-def resolve_modal_frequencies_hz(
-    basis: ModalBasis,
-    params: SynthParameters,
-) -> np.ndarray:
-    """Apply physical size/material scaling and musical tuning outside the backend.
-
-    This preserves the v12 rectangle expression:
-        omega = pi^2/(Lx*Ly) * sqrt(D/(rho*H)) * modal_factor
-    while keeping D, rho, H and frequency_scale out of the modal predictor.
-    """
-    if min(
-        params.length_x_m,
-        params.length_y_m,
-        params.flexural_rigidity,
-        params.density,
-        params.thickness_m,
-        params.frequency_scale,
-    ) <= 0.0:
-        raise ValueError("physical dimensions/material/frequency_scale must be > 0")
-
-    scale = (
-        np.pi**2
-        / (params.length_x_m * params.length_y_m)
+def resolve_modal_frequencies_hz(basis: ModalBasis, params: SynthParameters) -> np.ndarray:
+    if min(params.size_m, params.flexural_rigidity, params.density, params.thickness_m, params.frequency_scale) <= 0.0:
+        raise ValueError("size/material/frequency scale must be positive")
+    omega = (
+        np.asarray(basis.modal_factors, dtype=np.float64)
         * np.sqrt(params.flexural_rigidity / (params.density * params.thickness_m))
+        / (params.size_m * params.size_m)
     )
-    omega = scale * np.asarray(basis.modal_factors, dtype=np.float64)
-    frequencies = omega / (2.0 * np.pi)
-    frequencies *= float(params.frequency_scale)
-    return np.ascontiguousarray(frequencies, dtype=np.float64)
+    return np.ascontiguousarray(omega * float(params.frequency_scale) / (2.0 * np.pi), dtype=np.float64)
