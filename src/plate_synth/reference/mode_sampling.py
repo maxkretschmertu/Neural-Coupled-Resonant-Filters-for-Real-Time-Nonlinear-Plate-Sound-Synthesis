@@ -77,6 +77,18 @@ def sample_modes_on_material_grid(
     if n_modes < 1 or n_modes > solution.n_solved:
         raise ValueError("n_modes must be within the solved eigenpair count")
 
+    # n_solve > n_modes is intentional: the extra eigenpairs let us verify
+    # that the fixed stored cutoff does not split a repeated eigenspace.
+    if solution.n_solved > n_modes:
+        lam_lo = float(solution.eigenvalues[n_modes - 1])
+        lam_hi = float(solution.eigenvalues[n_modes])
+        cutoff_gap = abs(lam_hi - lam_lo) / max(abs(lam_hi), abs(lam_lo), 1e-30)
+        if cutoff_gap <= degeneracy_relative_gap:
+            raise RuntimeError(
+                "stored mode cutoff splits a near-degenerate eigenspace; "
+                "change n_modes or the dataset convention before training"
+            )
+
     grid = make_material_grid(geometry, grid_size)
     rho = np.asarray(grid.rho, dtype=np.float64)
     # Points exactly on the piecewise-linear Gmsh boundary can be classified
