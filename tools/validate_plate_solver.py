@@ -49,7 +49,7 @@ def main() -> None:
         default=0.02,
         help=(
             "relative modal-factor gap below which neighbouring analytical modes "
-            "are treated as one numerically unresolved validation subspace"
+            "inside the stored target range are judged as one validation subspace"
         ),
     )
     parser.add_argument("--matching-shape-weight", type=float, default=0.25)
@@ -86,20 +86,42 @@ def main() -> None:
     for aspect in args.aspects:
         shape_mod = shape_mod_for_aspect(aspect)
         geometry = make_geometry(0.0, shape_mod, args.grid, args.boundary_samples)
-        analytic = AnalyticRectangleBackend(args.grid).predict(
-            geometry, args.n_modes, "simply_supported"
-        )
 
-        # Keep the physical degeneracy definition separate from the validation
-        # comparison bands.  At a finite mesh size, distinct exact modes whose
-        # analytical spacing is comparable to the discretization error can
-        # cross and rotate.  Their span is the stable quantity to validate.
-        physical_groups = detect_degenerate_groups(
-            np.asarray(analytic.modal_factors) ** 2, args.degeneracy_gap
+        # Probe one analytical mode beyond the FEM solve horizon.  This lets us
+        # prove that a physical eigenspace intersecting the stored N-mode cutoff
+        # is complete.  The square at N=32 is the important example: reference
+        # modes 30, 31 and 32 form one three-dimensional eigenspace.  Comparing
+        # only modes 30 and 31 against an arbitrary two-dimensional slice of the
+        # FEM eigenspace creates a false low subspace score.
+        analytic_probe = AnalyticRectangleBackend(args.grid).predict(
+            geometry, args.n_solve + 1, "simply_supported"
         )
-        comparison_groups = detect_degenerate_groups(
-            np.asarray(analytic.modal_factors), args.comparison_group_gap
+        probe_factors = np.asarray(analytic_probe.modal_factors, dtype=np.float64)
+        probe_physical_groups = detect_degenerate_groups(
+            probe_factors**2, args.degeneracy_gap
         )
+        cutoff_group_id = probe_physical_groups[args.n_modes - 1]
+        cutoff_group_indices = np.flatnonzero(
+            probe_physical_groups == cutoff_group_id
+        )
+        cutoff_group_end = int(cutoff_group_indices[-1])
+        if cutoff_group_end >= args.n_solve:
+            raise SystemExit(
+                f"aspect {aspect:g}: physical eigenspace crossing the N={args.n_modes} "
+                f"cutoff extends beyond n_solve={args.n_solve}; increase --n-solve"
+            )
+
+        comparison_count = max(args.n_modes, cutoff_group_end + 1)
+        analytic_factors = probe_factors[:comparison_count]
+        analytic_modes = np.asarray(
+            analytic_probe.mode_shapes[:comparison_count], dtype=np.float64
+        )
+        physical_groups = probe_physical_groups[:comparison_count]
+        target_comparison_groups = detect_degenerate_groups(
+            analytic_factors[: args.n_modes], args.comparison_group_gap
+        )
+        cutoff_extended = cutoff_group_end >= args.n_modes
+
         by_h: dict[float, np.ndarray] = {}
 
         for h in h_values:
@@ -113,10 +135,18 @@ def main() -> None:
                     boundary_condition="simply_supported",
                 ),
             )
+            if solution.n_solved < comparison_count:
+                raise RuntimeError(
+                    f"only {solution.n_solved} FEM modes available, but validation "
+                    f"needs {comparison_count} to complete the cutoff eigenspace"
+                )
+
+            # Sample the extra solved FEM modes as well. They are validation-only
+            # guard modes and are not part of the N-mode dataset target.
             sampled = sample_modes_on_material_grid(
                 solution,
                 geometry,
-                n_modes=args.n_modes,
+                n_modes=solution.n_solved,
                 grid_size=args.grid,
                 degeneracy_relative_gap=args.degeneracy_gap,
             )
@@ -124,48 +154,74 @@ def main() -> None:
             match = match_modes_to_reference(
                 sampled.modal_factors,
                 sampled.mode_shapes,
-                analytic.modal_factors,
-                analytic.mode_shapes,
+                analytic_factors,
+                analytic_modes,
                 sampled.inner_product_weights,
                 shape_tiebreak_weight=args.matching_shape_weight,
             )
 
-            # Stabilize scalar factor order over every comparison band. This is
-            # deliberately broader than exact physical degeneracy: if two exact
-            # modes are separated by less than the current validation resolution,
-            # a finite mesh may swap them without indicating a bad solver.
+            # Only true/near-true physical degeneracies are reordered for scalar
+            # factor comparison.  Near-but-distinct validation bands keep their
+            # shape-led Hungarian identity; their span is used only for the shape
+            # score itself.
             assignment = reorder_match_within_reference_groups(
                 sampled.modal_factors,
                 match.fem_for_reference,
-                comparison_groups,
+                physical_groups,
             )
-            ordered_factors = np.asarray(sampled.modal_factors)[assignment]
+            ordered_factors = np.asarray(sampled.modal_factors)[
+                assignment[: args.n_modes]
+            ]
             by_h[h] = ordered_factors.copy()
-            rel = np.abs(ordered_factors / analytic.modal_factors - 1.0)
+            rel = np.abs(
+                ordered_factors / analytic_factors[: args.n_modes] - 1.0
+            )
 
             shape_score = np.empty(args.n_modes, dtype=np.float64)
             score_kind = np.empty(args.n_modes, dtype=object)
-            group_size = np.ones(args.n_modes, dtype=np.int32)
+            comparison_group_size = np.ones(args.n_modes, dtype=np.int32)
             physical_group_size = np.ones(args.n_modes, dtype=np.int32)
-            for indices in _group_indices(physical_groups):
-                physical_group_size[indices] = indices.size
+            cutoff_group_extended = np.zeros(args.n_modes, dtype=np.uint8)
 
-            for indices in _group_indices(comparison_groups):
-                fem_indices = assignment[indices]
-                if indices.size == 1:
-                    reference_i = int(indices[0])
+            for indices in _group_indices(physical_groups):
+                target_indices = indices[indices < args.n_modes]
+                if target_indices.size:
+                    physical_group_size[target_indices] = indices.size
+
+            cutoff_target_members = cutoff_group_indices[
+                cutoff_group_indices < args.n_modes
+            ]
+
+            for target_indices in _group_indices(target_comparison_groups):
+                eval_indices = target_indices
+                kind = "mac" if target_indices.size == 1 else "band_subspace"
+
+                # If the fixed output cutoff slices through a genuine physical
+                # eigenspace, validate the COMPLETE eigenspace using the guard
+                # modes above N.  A truncated subspace has no unique orientation
+                # and must not be used as a shape-quality gate.
+                if cutoff_extended and np.intersect1d(
+                    target_indices, cutoff_target_members
+                ).size:
+                    eval_indices = cutoff_group_indices
+                    kind = "cutoff_physical_subspace"
+                    cutoff_group_extended[target_indices] = 1
+
+                fem_indices = assignment[eval_indices]
+                if eval_indices.size == 1:
+                    reference_i = int(eval_indices[0])
                     fem_i = int(fem_indices[0])
-                    shape_score[reference_i] = match.mac_matrix[fem_i, reference_i]
-                    score_kind[reference_i] = "mac"
+                    score = float(match.mac_matrix[fem_i, reference_i])
                 else:
                     score = subspace_projection_score(
                         sampled.mode_shapes[fem_indices],
-                        analytic.mode_shapes[indices],
+                        analytic_modes[eval_indices],
                         sampled.inner_product_weights,
                     )
-                    shape_score[indices] = score
-                    score_kind[indices] = "band_subspace"
-                    group_size[indices] = indices.size
+
+                shape_score[target_indices] = score
+                score_kind[target_indices] = kind
+                comparison_group_size[target_indices] = eval_indices.size
 
             for i in range(args.n_modes):
                 fem_i = int(assignment[i])
@@ -174,13 +230,14 @@ def main() -> None:
                     "h_target": float(h),
                     "mode": int(i),
                     "fem_mode": fem_i,
-                    "analytic_factor": float(analytic.modal_factors[i]),
+                    "analytic_factor": float(analytic_factors[i]),
                     "fem_factor": float(ordered_factors[i]),
                     "relative_error": float(rel[i]),
                     "shape_score": float(shape_score[i]),
                     "score_kind": str(score_kind[i]),
-                    "comparison_group_size": int(group_size[i]),
+                    "comparison_group_size": int(comparison_group_size[i]),
                     "physical_degenerate_group_size": int(physical_group_size[i]),
+                    "cutoff_group_extended": int(cutoff_group_extended[i]),
                     "residual": float(sampled.residuals[fem_i]),
                     "mesh_vertices": mesh.n_vertices,
                     "mesh_triangles": mesh.n_triangles,
@@ -266,10 +323,11 @@ def main() -> None:
 
     print("\nWorst finest-mesh shape comparisons:")
     for row in sorted(finest_rows, key=lambda item: float(item["shape_score"]))[:8]:
+        suffix = " +guard" if int(row["cutoff_group_extended"]) else ""
         print(
             " - aspect={aspect:g}, ref={mode}, fem={fem_mode}, "
-            "score={shape_score:.6f} ({score_kind}, band={comparison_group_size}), "
-            "freq_err={relative_error:.3e}".format(**row)
+            "score={shape_score:.6f} ({score_kind}, band={comparison_group_size}{suffix}), "
+            "freq_err={relative_error:.3e}".format(suffix=suffix, **row)
         )
 
     if failures:
