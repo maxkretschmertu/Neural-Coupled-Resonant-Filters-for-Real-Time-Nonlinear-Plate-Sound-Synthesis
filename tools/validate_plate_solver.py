@@ -43,7 +43,16 @@ def main() -> None:
     parser.add_argument("--boundary-samples", type=int, default=720)
     parser.add_argument("--poisson", type=float, default=0.30)
     parser.add_argument("--degeneracy-gap", type=float, default=5e-4)
-    parser.add_argument("--matching-shape-tiebreak", type=float, default=1e-3)
+    parser.add_argument(
+        "--comparison-group-gap",
+        type=float,
+        default=0.02,
+        help=(
+            "relative modal-factor gap below which neighbouring analytical modes "
+            "are treated as one numerically unresolved validation subspace"
+        ),
+    )
+    parser.add_argument("--matching-shape-weight", type=float, default=0.25)
     parser.add_argument("--aspects", type=float, nargs="+", default=[1.0, 1.5, 2.0, 3.0, 4.0])
     parser.add_argument("--h", type=float, nargs="+", default=[0.12, 0.08, 0.055])
     parser.add_argument("--low-mode-count", type=int, default=16)
@@ -59,8 +68,10 @@ def main() -> None:
         raise SystemExit("--n-solve must exceed --n-modes so cutoff degeneracy is observable")
     if len(args.h) < 2:
         raise SystemExit("provide at least two mesh sizes for convergence validation")
-    if args.matching_shape_tiebreak < 0.0:
-        raise SystemExit("--matching-shape-tiebreak must be non-negative")
+    if args.matching_shape_weight < 0.0:
+        raise SystemExit("--matching-shape-weight must be non-negative")
+    if args.comparison_group_gap < args.degeneracy_gap:
+        raise SystemExit("--comparison-group-gap must be >= --degeneracy-gap")
 
     args.output.mkdir(parents=True, exist_ok=True)
     freq_rows: list[dict[str, float | int | str]] = []
@@ -78,8 +89,16 @@ def main() -> None:
         analytic = AnalyticRectangleBackend(args.grid).predict(
             geometry, args.n_modes, "simply_supported"
         )
-        analytic_groups = detect_degenerate_groups(
+
+        # Keep the physical degeneracy definition separate from the validation
+        # comparison bands.  At a finite mesh size, distinct exact modes whose
+        # analytical spacing is comparable to the discretization error can
+        # cross and rotate.  Their span is the stable quantity to validate.
+        physical_groups = detect_degenerate_groups(
             np.asarray(analytic.modal_factors) ** 2, args.degeneracy_gap
+        )
+        comparison_groups = detect_degenerate_groups(
+            np.asarray(analytic.modal_factors), args.comparison_group_gap
         )
         by_h: dict[float, np.ndarray] = {}
 
@@ -102,22 +121,23 @@ def main() -> None:
                 degeneracy_relative_gap=args.degeneracy_gap,
             )
 
-            # Do not assume eigsh returns the same mode ordering as the
-            # analytical backend.  Match globally by frequency with MAC only as
-            # a small tie-breaker, then stabilize ordering inside repeated
-            # reference eigenspaces by sorting their selected FEM factors.
             match = match_modes_to_reference(
                 sampled.modal_factors,
                 sampled.mode_shapes,
                 analytic.modal_factors,
                 analytic.mode_shapes,
                 sampled.inner_product_weights,
-                shape_tiebreak_weight=args.matching_shape_tiebreak,
+                shape_tiebreak_weight=args.matching_shape_weight,
             )
+
+            # Stabilize scalar factor order over every comparison band. This is
+            # deliberately broader than exact physical degeneracy: if two exact
+            # modes are separated by less than the current validation resolution,
+            # a finite mesh may swap them without indicating a bad solver.
             assignment = reorder_match_within_reference_groups(
                 sampled.modal_factors,
                 match.fem_for_reference,
-                analytic_groups,
+                comparison_groups,
             )
             ordered_factors = np.asarray(sampled.modal_factors)[assignment]
             by_h[h] = ordered_factors.copy()
@@ -126,7 +146,11 @@ def main() -> None:
             shape_score = np.empty(args.n_modes, dtype=np.float64)
             score_kind = np.empty(args.n_modes, dtype=object)
             group_size = np.ones(args.n_modes, dtype=np.int32)
-            for indices in _group_indices(analytic_groups):
+            physical_group_size = np.ones(args.n_modes, dtype=np.int32)
+            for indices in _group_indices(physical_groups):
+                physical_group_size[indices] = indices.size
+
+            for indices in _group_indices(comparison_groups):
                 fem_indices = assignment[indices]
                 if indices.size == 1:
                     reference_i = int(indices[0])
@@ -140,7 +164,7 @@ def main() -> None:
                         sampled.inner_product_weights,
                     )
                     shape_score[indices] = score
-                    score_kind[indices] = "subspace"
+                    score_kind[indices] = "band_subspace"
                     group_size[indices] = indices.size
 
             for i in range(args.n_modes):
@@ -155,7 +179,8 @@ def main() -> None:
                     "relative_error": float(rel[i]),
                     "shape_score": float(shape_score[i]),
                     "score_kind": str(score_kind[i]),
-                    "group_size": int(group_size[i]),
+                    "comparison_group_size": int(group_size[i]),
+                    "physical_degenerate_group_size": int(physical_group_size[i]),
                     "residual": float(sampled.residuals[fem_i]),
                     "mesh_vertices": mesh.n_vertices,
                     "mesh_triangles": mesh.n_triangles,
@@ -238,6 +263,14 @@ def main() -> None:
     if np.any(high):
         print(f"finest high-mode relative error max={high_max:.3e}")
     print(f"finest MAC/subspace score min={min_score:.6f}")
+
+    print("\nWorst finest-mesh shape comparisons:")
+    for row in sorted(finest_rows, key=lambda item: float(item["shape_score"]))[:8]:
+        print(
+            " - aspect={aspect:g}, ref={mode}, fem={fem_mode}, "
+            "score={shape_score:.6f} ({score_kind}, band={comparison_group_size}), "
+            "freq_err={relative_error:.3e}".format(**row)
+        )
 
     if failures:
         print("\nVALIDATION FAILED:")
