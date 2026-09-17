@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from unittest import SkipTest
 
 import numpy as np
 
@@ -25,7 +26,13 @@ from plate_synth.reference.dataset import (
 )
 from plate_synth.reference.mesh import ReferenceMesh
 from plate_synth.reference.mode_sampling import SampledModes, canonicalize_mode_sign, detect_degenerate_groups
-from plate_synth.reference.validation import SampleQualityReport, modal_assurance_matrix, subspace_projection_score
+from plate_synth.reference.validation import (
+    SampleQualityReport,
+    match_modes_to_reference,
+    modal_assurance_matrix,
+    reorder_match_within_reference_groups,
+    subspace_projection_score,
+)
 
 
 def test_dataset_split_is_deterministic_disjoint_and_contains_family_anchors() -> None:
@@ -57,8 +64,8 @@ def test_dataset_fingerprint_tracks_numerical_contract_not_execution_details() -
 def test_resume_rejects_incompatible_shard() -> None:
     try:
         import h5py
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise SkipTest("h5py is not installed") from exc
     cfg = DatasetConfig(train_count=1, val_count=0, test_count=0)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -76,8 +83,8 @@ def test_resume_rejects_incompatible_shard() -> None:
 def test_hdf5_shard_roundtrip_persists_integrity_metadata() -> None:
     try:
         import h5py
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise SkipTest("h5py is not installed") from exc
 
     cfg = DatasetConfig(
         train_count=1,
@@ -175,6 +182,35 @@ def test_mac_is_sign_invariant() -> None:
     np.testing.assert_allclose(mac[0, 0], 1.0, atol=1e-12)
 
 
+def test_frequency_aware_matching_handles_swapped_modes() -> None:
+    reference_modes = np.zeros((3, 4, 4), dtype=np.float64)
+    reference_modes[0, 0, 0] = 1.0
+    reference_modes[1, 1, 1] = 1.0
+    reference_modes[2, 2, 2] = 1.0
+    fem_modes = reference_modes[[1, 0, 2]].copy()
+    reference_factors = np.array([1.0, 1.1, 2.0])
+    fem_factors = np.array([1.1, 1.0, 2.0])
+    weights = np.ones((4, 4), dtype=np.float64) / 16.0
+
+    match = match_modes_to_reference(
+        fem_factors,
+        fem_modes,
+        reference_factors,
+        reference_modes,
+        weights,
+    )
+    np.testing.assert_array_equal(match.fem_for_reference, [1, 0, 2])
+    np.testing.assert_allclose(match.pair_relative_error, 0.0, atol=1e-14)
+
+
+def test_group_reordering_stabilizes_degenerate_factor_order() -> None:
+    fem_factors = np.array([5.02, 4.98, 9.0])
+    assignment = np.array([0, 1, 2])
+    groups = np.array([0, 0, 1], dtype=np.int16)
+    ordered = reorder_match_within_reference_groups(fem_factors, assignment, groups)
+    np.testing.assert_array_equal(ordered, [1, 0, 2])
+
+
 def test_subspace_score_is_basis_rotation_invariant() -> None:
     rng = np.random.default_rng(9)
     raw = rng.normal(size=(2, 12, 12))
@@ -203,7 +239,7 @@ def test_material_grid_exposes_unrenormalized_quadrature_error() -> None:
 
 def test_optional_fem_rectangle_aspect4_and_nonrectangle() -> None:
     if os.environ.get("PLATE_SYNTH_RUN_FEM_TESTS") != "1":
-        return
+        raise SkipTest("set PLATE_SYNTH_RUN_FEM_TESTS=1 to run Gmsh/scikit-fem integration tests")
     from plate_synth.reference.mesh import mesh_geometry
     from plate_synth.reference.mode_sampling import sample_modes_on_material_grid
     from plate_synth.reference.plate_solver import PlateSolverConfig, solve_plate_modes
@@ -223,16 +259,30 @@ def test_optional_fem_rectangle_aspect4_and_nonrectangle() -> None:
 
         if morph == 0.0:
             analytic = AnalyticRectangleBackend(32).predict(geometry, 4, "simply_supported")
-            rel = np.abs(sampled.modal_factors / analytic.modal_factors - 1.0)
-            assert np.max(rel) < 0.10
+            match = match_modes_to_reference(
+                sampled.modal_factors,
+                sampled.mode_shapes,
+                analytic.modal_factors,
+                analytic.mode_shapes,
+                sampled.inner_product_weights,
+            )
+            assert np.max(match.pair_relative_error) < 0.10
 
 
 def main() -> None:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
+    passed = 0
+    skipped = 0
     for test in tests:
-        test()
-        print("PASS", test.__name__)
-    print(len(tests), "Phase-3 tests passed")
+        try:
+            test()
+        except SkipTest as exc:
+            skipped += 1
+            print("SKIP", test.__name__, "-", exc)
+        else:
+            passed += 1
+            print("PASS", test.__name__)
+    print(f"{passed} passed, {skipped} skipped ({len(tests)} Phase-3 tests total)")
 
 
 if __name__ == "__main__":
