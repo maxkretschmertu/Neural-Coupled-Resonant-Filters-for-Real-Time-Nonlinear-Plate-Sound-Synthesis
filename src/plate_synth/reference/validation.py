@@ -29,9 +29,14 @@ class ReferenceModeMatch:
     """One-to-one FEM -> analytical/reference mode assignment.
 
     ``fem_for_reference[j]`` is the FEM mode index assigned to reference mode
-    ``j``.  The assignment is frequency-led, with weighted MAC used only as a
-    small shape tie-breaker so close numerical crossings do not make validation
-    depend on raw eigensolver ordering.
+    ``j``.  The assignment combines relative modal-factor error and weighted
+    MAC.  A non-negligible shape term is intentional: at a finite mesh size,
+    two close modes may cross by more than their exact analytical spacing, so
+    frequency-only matching can pair two orthogonal shapes even when both FEM
+    modes are physically correct.
+
+    Repeated or numerically unresolved reference bands should still be judged
+    later as complete subspaces rather than by individual MAC values.
     """
 
     fem_for_reference: np.ndarray
@@ -88,18 +93,18 @@ def match_modes_to_reference(
     reference_modes: np.ndarray,
     weights: np.ndarray,
     *,
-    shape_tiebreak_weight: float = 1e-3,
+    shape_tiebreak_weight: float = 0.25,
 ) -> ReferenceModeMatch:
     """Match FEM modes to a reference basis without trusting raw mode order.
 
-    The Hungarian assignment minimizes
+    Hungarian assignment minimizes
 
-        relative_frequency_error + eps * (1 - MAC)
+        relative_frequency_error + w_shape * (1 - MAC).
 
-    where ``eps`` is intentionally small.  Frequency therefore defines modal
-    identity for the rectangle validation while MAC only resolves close/tied
-    choices.  Repeated reference eigenspaces are evaluated later as complete
-    subspaces; the within-group assignment is physically irrelevant.
+    The default shape weight is deliberately large enough to survive numerical
+    crossings of close FEM eigenvalues.  It is not used to claim that a member
+    of a repeated eigenspace has unique identity: repeated/near-unresolved
+    bands are evaluated later by a basis-invariant subspace score.
     """
     try:
         from scipy.optimize import linear_sum_assignment
@@ -149,13 +154,13 @@ def reorder_match_within_reference_groups(
     fem_for_reference: np.ndarray,
     reference_group_ids: np.ndarray,
 ) -> np.ndarray:
-    """Make factor ordering deterministic inside repeated/near-repeated groups.
+    """Make factor ordering deterministic inside repeated/unresolved groups.
 
     Subspace scores do not care which vector represents which member of a
-    repeated eigenspace, but mesh-convergence tables compare scalar modal
-    factors.  Sorting the selected FEM factors inside each reference group
-    prevents arbitrary eigensolver basis/order changes from creating fake
-    convergence jumps.
+    repeated or numerically unresolved band, but frequency/convergence tables
+    compare scalar modal factors. Sorting the selected FEM factors inside each
+    reference group prevents arbitrary eigensolver basis/order changes from
+    creating fake convergence jumps.
     """
     factors = np.asarray(fem_factors, dtype=np.float64)
     assignment = np.asarray(fem_for_reference, dtype=np.int64).copy()
