@@ -227,6 +227,45 @@ def test_subspace_score_is_basis_rotation_invariant() -> None:
     np.testing.assert_allclose(score, 1.0, atol=1e-12)
 
 
+def test_square_32_mode_cutoff_splits_a_threefold_physical_eigenspace() -> None:
+    geometry = make_geometry(0.0, 0.0, grid_size=32, boundary_samples=180)
+    analytic = AnalyticRectangleBackend(32).predict(
+        geometry, 40, "simply_supported"
+    )
+    groups = detect_degenerate_groups(
+        np.asarray(analytic.modal_factors) ** 2, relative_gap=5e-4
+    )
+    cutoff_group = np.flatnonzero(groups == groups[31])
+    np.testing.assert_array_equal(cutoff_group, np.array([30, 31, 32]))
+
+
+def test_truncated_slice_of_rotated_eigenspace_is_not_a_valid_subspace_gate() -> None:
+    # A three-dimensional repeated eigenspace may be returned in any orthogonal
+    # basis.  Comparing only two vectors on each side can therefore score below
+    # one even though the COMPLETE physical eigenspaces are identical.
+    reference = np.zeros((3, 4, 4), dtype=np.float64)
+    reference[0, 0, 0] = 4.0
+    reference[1, 1, 1] = 4.0
+    reference[2, 2, 2] = 4.0
+    weights = np.ones((4, 4), dtype=np.float64) / 16.0
+
+    q, _ = np.linalg.qr(
+        np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [2.0, -1.0, 1.0],
+                [1.0, 1.0, -1.0],
+            ],
+            dtype=np.float64,
+        )
+    )
+    rotated = (q @ reference.reshape(3, -1)).reshape(3, 4, 4)
+    truncated = subspace_projection_score(reference[:2], rotated[:2], weights)
+    complete = subspace_projection_score(reference, rotated, weights)
+    assert truncated < 0.95
+    np.testing.assert_allclose(complete, 1.0, atol=1e-12)
+
+
 def test_material_grid_exposes_unrenormalized_quadrature_error() -> None:
     geometry = make_geometry(0.83, 0.91, grid_size=32, boundary_samples=360)
     grid = make_material_grid(geometry, 64)
