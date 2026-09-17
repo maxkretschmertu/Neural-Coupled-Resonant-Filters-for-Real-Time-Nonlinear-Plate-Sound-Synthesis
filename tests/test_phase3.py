@@ -145,7 +145,7 @@ def test_hdf5_shard_roundtrip_persists_integrity_metadata() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         writer = _ShardWriter(root, "train", cfg)
-        writer.append(sample)  # shard_size=1 closes and atomically finalizes
+        writer.append(sample)
         path = root / "train_00000.h5"
         assert path.exists()
         assert not (root / "train_00000.partial.h5").exists()
@@ -238,7 +238,7 @@ def test_material_grid_exposes_unrenormalized_quadrature_error() -> None:
 
 
 def test_optional_fem_rectangle_aspect4_and_nonrectangle() -> None:
-    if os.environ.get("PLATE_SYNTH_RUN_FEM_TESTS") != "1":
+    if os.environ.get("PLATE_SYNTH_RUN_FEM_TESTS", "").strip() != "1":
         raise SkipTest("set PLATE_SYNTH_RUN_FEM_TESTS=1 to run Gmsh/scikit-fem integration tests")
     from plate_synth.reference.mesh import mesh_geometry
     from plate_synth.reference.mode_sampling import sample_modes_on_material_grid
