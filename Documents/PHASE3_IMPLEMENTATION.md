@@ -69,7 +69,7 @@ pip install -r requirements-phase3.txt
 - `reference/mesh.py`: Gmsh polygon meshing, edge statistics, mesh-area error and an approximate symmetric boundary Hausdorff distance against the Phase-2 target contour.
 - `reference/plate_solver.py`: Morley Kirchhoff eigenproblem, simply-supported BC, FEM mass normalization, residuals and orthogonality QA.
 - `reference/mode_sampling.py`: FEM displacement modes sampled on the canonical material grid, target normalization, sign convention, degeneracy groups, cutoff loss masks and raw grid-quadrature diagnostics.
-- `reference/validation.py`: MAC/subspace tools and hard per-sample QA gates.
+- `reference/validation.py`: frequency-aware Hungarian reference matching, MAC/subspace tools and hard per-sample QA gates.
 - `reference/dataset.py`: deterministic disjoint splits, multiprocessing, HDF5 sharding, config fingerprints, safe resume, manifest and failure logging.
 
 ## Solver validation must precede full generation
@@ -80,7 +80,9 @@ Run:
 python tools/validate_plate_solver.py
 ```
 
-The validation covers rectangle aspect ratios 1, 1.5, 2, 3 and 4 over several mesh sizes. Nondegenerate modes use weighted MAC. Degenerate analytical eigenspaces use a basis-invariant subspace projection score, so a physically equivalent rotation inside a repeated eigenspace is not incorrectly penalized.
+The validation covers rectangle aspect ratios 1, 1.5, 2, 3 and 4 over several mesh sizes. Raw eigensolver indices are **not** trusted. FEM modes are assigned to analytical reference modes with a Hungarian solve whose cost is led by relative modal-factor error with only a small MAC tie-break term. This makes close numerical mode swaps harmless. Within repeated/near-repeated analytical groups, selected FEM factors are sorted before scalar convergence comparisons so arbitrary eigensolver order does not create fake convergence jumps.
+
+Nondegenerate reference modes use weighted MAC after matching. Degenerate analytical eigenspaces use a basis-invariant subspace projection score on the full matched eigenspace, so a physically equivalent rotation inside a repeated eigenspace is not incorrectly penalized.
 
 The tool writes:
 
@@ -89,7 +91,9 @@ validation/phase3/rectangle_frequency_shape.csv
 validation/phase3/mesh_convergence.csv
 ```
 
-and exits with code 1 if the configured hard gates fail. Default gates include:
+`rectangle_frequency_shape.csv` records both the reference mode and the matched FEM mode index.
+
+The validator exits with code 1 if the configured hard gates fail. Default gates include:
 
 - first 16 modal factors: max relative error 0.5%,
 - modes above 16: max relative error 1%,
@@ -98,7 +102,17 @@ and exits with code 1 if the configured hard gates fail. Default gates include:
 - mesh/target relative area error 0.5%,
 - approximate boundary distance 0.01 in normalized coordinates.
 
-These are acceptance gates, not claims that the supplied `mesh_edge_length=0.055` will automatically satisfy them. If validation fails, refine the mesh/config and rerun validation before generating labels.
+These are acceptance gates, not claims that the supplied `mesh_edge_length=0.055` will automatically satisfy them. If validation fails, refine the mesh/config and rerun validation before generating labels. A useful focused convergence run is:
+
+```bash
+python tools/validate_plate_solver.py --aspects 1 --h 0.055 0.04 0.028 0.02
+```
+
+then, if that converges satisfactorily, repeat over all aspect ratios:
+
+```bash
+python tools/validate_plate_solver.py --h 0.04 0.028 0.02
+```
 
 ## Target representation
 
@@ -171,10 +185,30 @@ The final config is 8000/1000/1000 train/validation/test. The pilot config is 25
 
 ## Pilot and final generation
 
-First run cheap/unit checks and the optional real FEM integration tests:
+First run the cheap/unit checks:
 
 ```bash
 python tests/test_phase3.py
+```
+
+The optional real Gmsh/scikit-fem integration test is reported as `SKIP` unless `PLATE_SYNTH_RUN_FEM_TESTS=1` is set. Use the shell-appropriate syntax:
+
+**Windows cmd.exe / Anaconda Prompt**
+
+```bat
+set PLATE_SYNTH_RUN_FEM_TESTS=1 && python tests/test_phase3.py
+```
+
+**PowerShell**
+
+```powershell
+$env:PLATE_SYNTH_RUN_FEM_TESTS="1"
+python tests/test_phase3.py
+```
+
+**bash/zsh**
+
+```bash
 PLATE_SYNTH_RUN_FEM_TESTS=1 python tests/test_phase3.py
 ```
 
