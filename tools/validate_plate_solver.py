@@ -17,7 +17,11 @@ from plate_synth.modal_backend import AnalyticRectangleBackend
 from plate_synth.reference.mesh import mesh_geometry
 from plate_synth.reference.mode_sampling import detect_degenerate_groups, sample_modes_on_material_grid
 from plate_synth.reference.plate_solver import PlateSolverConfig, solve_plate_modes
-from plate_synth.reference.validation import modal_assurance_matrix, subspace_projection_score
+from plate_synth.reference.validation import (
+    match_modes_to_reference,
+    reorder_match_within_reference_groups,
+    subspace_projection_score,
+)
 
 
 def shape_mod_for_aspect(aspect: float) -> float:
@@ -39,6 +43,7 @@ def main() -> None:
     parser.add_argument("--boundary-samples", type=int, default=720)
     parser.add_argument("--poisson", type=float, default=0.30)
     parser.add_argument("--degeneracy-gap", type=float, default=5e-4)
+    parser.add_argument("--matching-shape-tiebreak", type=float, default=1e-3)
     parser.add_argument("--aspects", type=float, nargs="+", default=[1.0, 1.5, 2.0, 3.0, 4.0])
     parser.add_argument("--h", type=float, nargs="+", default=[0.12, 0.08, 0.055])
     parser.add_argument("--low-mode-count", type=int, default=16)
@@ -54,6 +59,8 @@ def main() -> None:
         raise SystemExit("--n-solve must exceed --n-modes so cutoff degeneracy is observable")
     if len(args.h) < 2:
         raise SystemExit("provide at least two mesh sizes for convergence validation")
+    if args.matching_shape_tiebreak < 0.0:
+        raise SystemExit("--matching-shape-tiebreak must be non-negative")
 
     args.output.mkdir(parents=True, exist_ok=True)
     freq_rows: list[dict[str, float | int | str]] = []
@@ -94,26 +101,41 @@ def main() -> None:
                 grid_size=args.grid,
                 degeneracy_relative_gap=args.degeneracy_gap,
             )
-            by_h[h] = sampled.modal_factors.copy()
 
-            rel = np.abs(sampled.modal_factors / analytic.modal_factors - 1.0)
-            mac = modal_assurance_matrix(
+            # Do not assume eigsh returns the same mode ordering as the
+            # analytical backend.  Match globally by frequency with MAC only as
+            # a small tie-breaker, then stabilize ordering inside repeated
+            # reference eigenspaces by sorting their selected FEM factors.
+            match = match_modes_to_reference(
+                sampled.modal_factors,
                 sampled.mode_shapes,
+                analytic.modal_factors,
                 analytic.mode_shapes,
                 sampled.inner_product_weights,
+                shape_tiebreak_weight=args.matching_shape_tiebreak,
             )
+            assignment = reorder_match_within_reference_groups(
+                sampled.modal_factors,
+                match.fem_for_reference,
+                analytic_groups,
+            )
+            ordered_factors = np.asarray(sampled.modal_factors)[assignment]
+            by_h[h] = ordered_factors.copy()
+            rel = np.abs(ordered_factors / analytic.modal_factors - 1.0)
 
             shape_score = np.empty(args.n_modes, dtype=np.float64)
             score_kind = np.empty(args.n_modes, dtype=object)
             group_size = np.ones(args.n_modes, dtype=np.int32)
             for indices in _group_indices(analytic_groups):
+                fem_indices = assignment[indices]
                 if indices.size == 1:
-                    i = int(indices[0])
-                    shape_score[i] = mac[i, i]
-                    score_kind[i] = "mac"
+                    reference_i = int(indices[0])
+                    fem_i = int(fem_indices[0])
+                    shape_score[reference_i] = match.mac_matrix[fem_i, reference_i]
+                    score_kind[reference_i] = "mac"
                 else:
                     score = subspace_projection_score(
-                        sampled.mode_shapes[indices],
+                        sampled.mode_shapes[fem_indices],
                         analytic.mode_shapes[indices],
                         sampled.inner_product_weights,
                     )
@@ -122,17 +144,19 @@ def main() -> None:
                     group_size[indices] = indices.size
 
             for i in range(args.n_modes):
+                fem_i = int(assignment[i])
                 row = {
                     "aspect": float(aspect),
                     "h_target": float(h),
                     "mode": int(i),
+                    "fem_mode": fem_i,
                     "analytic_factor": float(analytic.modal_factors[i]),
-                    "fem_factor": float(sampled.modal_factors[i]),
+                    "fem_factor": float(ordered_factors[i]),
                     "relative_error": float(rel[i]),
                     "shape_score": float(shape_score[i]),
                     "score_kind": str(score_kind[i]),
                     "group_size": int(group_size[i]),
-                    "residual": float(sampled.residuals[i]),
+                    "residual": float(sampled.residuals[fem_i]),
                     "mesh_vertices": mesh.n_vertices,
                     "mesh_triangles": mesh.n_triangles,
                     "mesh_area_error": float(mesh.relative_area_error),
