@@ -11,7 +11,14 @@ from .plate_solver import PlateEigenSolution
 
 @dataclass(frozen=True)
 class SampledModes:
-    """FEM modes sampled onto the canonical Phase-2 material grid."""
+    """FEM modes sampled onto the canonical Phase-2 material grid.
+
+    `mode_loss_mask` is one for ordinary stored targets.  If the fixed output
+    cutoff falls inside a near-degenerate eigenspace, all stored members of
+    that incomplete final group are set to zero in the mask.  The raw targets
+    are still stored for inspection, but Phase 4 can exclude those ambiguous
+    channels from per-mode losses instead of rejecting symmetric geometries.
+    """
 
     modal_factors: np.ndarray
     eigenvalues: np.ndarray
@@ -19,6 +26,8 @@ class SampledModes:
     area_weights: np.ndarray
     inner_product_weights: np.ndarray
     degenerate_group_id: np.ndarray
+    mode_loss_mask: np.ndarray
+    cutoff_group_complete: bool
     residuals: np.ndarray
 
     @property
@@ -43,11 +52,7 @@ def detect_degenerate_groups(
     eigenvalues: np.ndarray,
     relative_gap: float = 5e-4,
 ) -> np.ndarray:
-    """Group consecutive numerically near-degenerate eigenvalues.
-
-    Group identifiers are stable integers.  A singleton still receives its own
-    group id; Phase 4 can inspect group sizes to choose vector or subspace loss.
-    """
+    """Group consecutive numerically near-degenerate eigenvalues."""
     lam = np.asarray(eigenvalues, dtype=np.float64)
     if lam.ndim != 1 or lam.size == 0:
         raise ValueError("eigenvalues must be a non-empty 1D array")
@@ -64,6 +69,45 @@ def detect_degenerate_groups(
     return groups
 
 
+def training_mode_mask(
+    solved_eigenvalues: np.ndarray,
+    n_modes: int,
+    relative_gap: float = 5e-4,
+) -> tuple[np.ndarray, bool]:
+    """Return a loss mask which handles a degenerate group crossing the cutoff.
+
+    A fixed-size neural output cannot contain a complete eigenspace if mode N
+    is degenerate with mode N+1.  Rejecting such samples would systematically
+    remove exact symmetric shapes (e.g. square/circle).  Instead, mask the
+    stored members of that incomplete final group for per-mode training.  The
+    complete group remains available among the extra solved eigenpairs for QA.
+    """
+    lam = np.asarray(solved_eigenvalues, dtype=np.float64)
+    if n_modes < 1 or n_modes > lam.size:
+        raise ValueError("n_modes must be within solved_eigenvalues")
+    mask = np.ones(n_modes, dtype=np.float32)
+    if n_modes == lam.size:
+        return mask, True
+
+    gap = abs(lam[n_modes] - lam[n_modes - 1]) / max(
+        abs(lam[n_modes]), abs(lam[n_modes - 1]), 1e-30
+    )
+    if gap > relative_gap:
+        return mask, True
+
+    # Walk backwards over the complete stored portion of this final group.
+    start = n_modes - 1
+    while start > 0:
+        previous_gap = abs(lam[start] - lam[start - 1]) / max(
+            abs(lam[start]), abs(lam[start - 1]), 1e-30
+        )
+        if previous_gap > relative_gap:
+            break
+        start -= 1
+    mask[start:n_modes] = 0.0
+    return mask, False
+
+
 def sample_modes_on_material_grid(
     solution: PlateEigenSolution,
     geometry: GeometryDescription,
@@ -76,18 +120,6 @@ def sample_modes_on_material_grid(
     """Evaluate FEM displacement modes on the fixed canonical material grid."""
     if n_modes < 1 or n_modes > solution.n_solved:
         raise ValueError("n_modes must be within the solved eigenpair count")
-
-    # n_solve > n_modes is intentional: the extra eigenpairs let us verify
-    # that the fixed stored cutoff does not split a repeated eigenspace.
-    if solution.n_solved > n_modes:
-        lam_lo = float(solution.eigenvalues[n_modes - 1])
-        lam_hi = float(solution.eigenvalues[n_modes])
-        cutoff_gap = abs(lam_hi - lam_lo) / max(abs(lam_hi), abs(lam_lo), 1e-30)
-        if cutoff_gap <= degeneracy_relative_gap:
-            raise RuntimeError(
-                "stored mode cutoff splits a near-degenerate eigenspace; "
-                "change n_modes or the dataset convention before training"
-            )
 
     grid = make_material_grid(geometry, grid_size)
     rho = np.asarray(grid.rho, dtype=np.float64)
@@ -114,6 +146,11 @@ def sample_modes_on_material_grid(
         shapes[k] = mode
 
     lam = np.asarray(solution.eigenvalues[:n_modes], dtype=np.float64)
+    loss_mask, cutoff_complete = training_mode_mask(
+        solution.eigenvalues,
+        n_modes,
+        degeneracy_relative_gap,
+    )
     return SampledModes(
         modal_factors=np.ascontiguousarray(solution.modal_factors[:n_modes]),
         eigenvalues=np.ascontiguousarray(lam),
@@ -125,5 +162,7 @@ def sample_modes_on_material_grid(
         degenerate_group_id=np.ascontiguousarray(
             detect_degenerate_groups(lam, degeneracy_relative_gap), dtype=np.int16
         ),
+        mode_loss_mask=np.ascontiguousarray(loss_mask, dtype=np.float32),
+        cutoff_group_complete=bool(cutoff_complete),
         residuals=np.ascontiguousarray(solution.residuals[:n_modes]),
     )
