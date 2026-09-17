@@ -17,11 +17,15 @@ from plate_synth.material_coordinates import make_material_grid
 from plate_synth.modal_backend import AnalyticRectangleBackend
 from plate_synth.reference.dataset import (
     DatasetConfig,
+    GeneratedSample,
+    SampleSpec,
+    _ShardWriter,
     _validate_resume_compatibility,
     build_sample_specs,
 )
-from plate_synth.reference.mode_sampling import canonicalize_mode_sign, detect_degenerate_groups
-from plate_synth.reference.validation import modal_assurance_matrix, subspace_projection_score
+from plate_synth.reference.mesh import ReferenceMesh
+from plate_synth.reference.mode_sampling import SampledModes, canonicalize_mode_sign, detect_degenerate_groups
+from plate_synth.reference.validation import SampleQualityReport, modal_assurance_matrix, subspace_projection_score
 
 
 def test_dataset_split_is_deterministic_disjoint_and_contains_family_anchors() -> None:
@@ -69,6 +73,85 @@ def test_resume_rejects_incompatible_shard() -> None:
             raise AssertionError("incompatible shard must be rejected")
 
 
+def test_hdf5_shard_roundtrip_persists_integrity_metadata() -> None:
+    try:
+        import h5py
+    except ImportError:
+        return
+
+    cfg = DatasetConfig(
+        train_count=1,
+        val_count=0,
+        test_count=0,
+        n_modes=2,
+        n_solve=3,
+        shard_size=1,
+    )
+    sampled = SampledModes(
+        modal_factors=np.array([2.0, 3.0]),
+        eigenvalues=np.array([4.0, 9.0]),
+        mode_shapes=np.ones((2, 4, 4)),
+        area_weights=np.full((4, 4), 1.0 / 16.0),
+        inner_product_weights=np.full((4, 4), 1.0 / 16.0),
+        degenerate_group_id=np.array([0, 1], dtype=np.int16),
+        mode_loss_mask=np.ones(2, dtype=np.float32),
+        cutoff_group_complete=True,
+        residuals=np.array([1e-12, 2e-12]),
+        raw_grid_area_integral=0.98,
+        raw_grid_area_relative_error=0.02,
+    )
+    mesh = ReferenceMesh(
+        points=np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+        triangles=np.array([[0, 1, 2]], dtype=np.int32),
+        target_edge_length=0.1,
+        min_edge_length=1.0,
+        mean_edge_length=1.1,
+        max_edge_length=np.sqrt(2.0),
+        target_area=1.0,
+        mesh_area=0.999,
+        relative_area_error=0.001,
+        boundary_hausdorff_approx=0.002,
+    )
+    report = SampleQualityReport(
+        accepted=True,
+        reasons=(),
+        max_residual=2e-12,
+        mass_orthogonality_error=1e-12,
+        max_grid_norm_error=0.0,
+        modal_factor_relation_error=0.0,
+        area_weight_error=0.0,
+        inner_product_weight_error=0.0,
+        raw_grid_area_relative_error=0.02,
+        mesh_area_relative_error=0.001,
+        boundary_hausdorff_approx=0.002,
+    )
+    sample = GeneratedSample(
+        spec=SampleSpec("train-000000", "train", 0.2, 0.3),
+        sdf=np.zeros((4, 4), dtype=np.float32),
+        mask=np.ones((4, 4), dtype=np.uint8),
+        sampled=sampled,
+        report=report,
+        mesh=mesh,
+        mass_orthogonality_error=1e-12,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = _ShardWriter(root, "train", cfg)
+        writer.append(sample)  # shard_size=1 closes and atomically finalizes
+        path = root / "train_00000.h5"
+        assert path.exists()
+        assert not (root / "train_00000.partial.h5").exists()
+        with h5py.File(path, "r") as f:
+            assert f.attrs["config_fingerprint"] == cfg.fingerprint()
+            assert f["sample_id"][0].decode("utf-8") == "train-000000"
+            np.testing.assert_allclose(f["modal_factors"][0], [2.0, 3.0])
+            np.testing.assert_allclose(f["raw_grid_area_relative_error"][0], 0.02)
+            np.testing.assert_allclose(f["mesh_relative_area_error"][0], 0.001)
+            np.testing.assert_allclose(f["mesh_boundary_hausdorff_approx"][0], 0.002)
+        _validate_resume_compatibility(root, cfg)
+
+
 def test_degenerate_group_detection() -> None:
     lam = np.array([1.0, 1.0001, 2.0, 3.0, 3.0002])
     groups = detect_degenerate_groups(lam, relative_gap=5e-4)
@@ -96,7 +179,6 @@ def test_subspace_score_is_basis_rotation_invariant() -> None:
     rng = np.random.default_rng(9)
     raw = rng.normal(size=(2, 12, 12))
     weights = np.ones((12, 12), dtype=np.float64) / 144.0
-    # Weighted Gram-Schmidt gives a clean two-dimensional reference subspace.
     a = raw.reshape(2, -1)
     a[0] /= np.sqrt(np.sum(weights.ravel() * a[0] ** 2))
     a[1] -= np.sum(weights.ravel() * a[1] * a[0]) * a[0]
@@ -142,7 +224,7 @@ def test_optional_fem_rectangle_aspect4_and_nonrectangle() -> None:
         if morph == 0.0:
             analytic = AnalyticRectangleBackend(32).predict(geometry, 4, "simply_supported")
             rel = np.abs(sampled.modal_factors / analytic.modal_factors - 1.0)
-            assert np.max(rel) < 0.10  # coarse-mesh integration smoke tolerance
+            assert np.max(rel) < 0.10
 
 
 def main() -> None:
