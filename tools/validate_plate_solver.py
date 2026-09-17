@@ -133,3 +133,7 @@ def main() -> None:
     macs = np.asarray([row["mac"] for row in freq_rows], dtype=float)
     print(f"frequency relative error: median={np.median(errors):.3e}, max={np.max(errors):.3e}")
     print(f"MAC: median={np.median(macs):.6f}, min={np.min(macs):.6f}")
+
+
+if __name__ == "__main__":
+    main()
