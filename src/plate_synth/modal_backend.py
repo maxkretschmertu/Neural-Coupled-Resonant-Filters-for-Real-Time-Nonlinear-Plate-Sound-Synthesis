@@ -1,30 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil, sqrt
 from typing import Protocol
 
 import numpy as np
 
 from .config import SynthParameters
+from .geometry import GeometryDescription
 from .spatial import analytical_rectangle_weights, bilinear_sample_mode_maps
 
 
 @dataclass(frozen=True)
 class ModalBasis:
-    """Complete linear modal description consumed by the resonator synth.
+    """Geometry-dependent modal data produced by a modal backend.
 
-    `modal_factors` is intentionally generic. In the future neural backend it
-    will contain geometry-dependent dimensionless modal information. For the
-    legacy backend it stores the unscaled v12 modal factor.
-
-    `mode_shapes` is always provided on a canonical regular grid so the same
-    object can later be used for pickup sampling and modal-basis projection.
-    `legacy_mode_indices` is optional and exists only to reproduce the exact
-    analytical v12 strike/pickup weighting during regression.
+    Crucially, this object contains no material-scaled frequencies. A future
+    neural backend therefore only has to predict geometry-dependent modal
+    factors and mode shapes. Physical size, material, damping and tuning are
+    resolved afterwards by ordinary code.
     """
 
     modal_factors: np.ndarray
-    frequencies_hz: np.ndarray
     mode_shapes: np.ndarray
     geometry_sdf: np.ndarray
     integration_weights: np.ndarray
@@ -32,42 +29,27 @@ class ModalBasis:
 
     @property
     def n_modes(self) -> int:
-        return int(self.frequencies_hz.shape[0])
+        return int(self.modal_factors.shape[0])
 
     def sample_weights(self, x: float, y: float) -> np.ndarray:
-        """Return phi_k(x, y) for every mode."""
         if self.legacy_mode_indices is not None:
-            # Preserve exact v12 weighting for the legacy reference backend.
             return analytical_rectangle_weights(self.legacy_mode_indices, x, y)
         return bilinear_sample_mode_maps(self.mode_shapes, x, y)
 
-    def with_frequencies(self, frequencies_hz: np.ndarray) -> "ModalBasis":
-        freqs = np.ascontiguousarray(frequencies_hz, dtype=np.float64)
-        if freqs.shape != self.frequencies_hz.shape:
-            raise ValueError("frequency array shape must match the modal basis")
-        return ModalBasis(
-            modal_factors=self.modal_factors,
-            frequencies_hz=freqs,
-            mode_shapes=self.mode_shapes,
-            geometry_sdf=self.geometry_sdf,
-            integration_weights=self.integration_weights,
-            legacy_mode_indices=self.legacy_mode_indices,
-        )
-
 
 class ModalBackend(Protocol):
-    """Common interface for analytical and future neural modal models."""
+    """Geometry-only modal predictor contract used by analytical and NN backends."""
 
-    def predict(self, params: SynthParameters) -> ModalBasis:
+    def predict(self, geometry: GeometryDescription, n_modes: int) -> ModalBasis:
         ...
 
 
 class LegacyRectangleBackend:
-    """Analytical rectangle backend matching v12 as closely as possible.
+    """Rectangle reference backend preserving the historical v12 ordering.
 
-    This backend is a regression/reference implementation. The historical v12
-    mode enumeration and frequency expression are intentionally preserved here
-    rather than silently changed during the refactor.
+    For n_modes=90 the generated pairs are exactly the old order=10 list.
+    Other counts use the smallest legacy rectangular enumeration large enough
+    to supply the requested number of modes, then truncate it.
     """
 
     def __init__(self, shape_grid_size: int = 64) -> None:
@@ -76,83 +58,92 @@ class LegacyRectangleBackend:
         self.shape_grid_size = int(shape_grid_size)
 
     @staticmethod
-    def legacy_mode_indices(order: int) -> np.ndarray:
-        """Return the exact x * (x - 1) enumeration used in v12."""
-        if order < 1:
-            raise ValueError("legacy_mode_order must be >= 1")
+    def legacy_mode_indices(n_modes: int) -> np.ndarray:
+        if n_modes < 1:
+            raise ValueError("n_modes must be >= 1")
+        order = max(2, int(ceil((1.0 + sqrt(1.0 + 4.0 * n_modes)) / 2.0)))
         pairs = [(m, n) for m in range(1, order + 1) for n in range(1, order)]
-        return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        return np.asarray(pairs[:n_modes], dtype=np.int64).reshape(-1, 2)
 
-    @staticmethod
-    def legacy_frequencies_hz(
+    def _mode_shape_maps(
+        self,
         mode_indices: np.ndarray,
-        length_x_m: float,
-        length_y_m: float,
-        flexural_rigidity: float,
-        density: float,
-        thickness_m: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Reproduce the v12 `modes_to_freqs()` expression exactly."""
-        if min(length_x_m, length_y_m, flexural_rigidity, density, thickness_m) <= 0:
-            raise ValueError("plate dimensions and material parameters must be > 0")
+        geometry: GeometryDescription,
+    ) -> np.ndarray:
+        """Evaluate rectangle modes on the same canonical grid as the SDF."""
+        n = geometry.grid_size
+        aspect = geometry.aspect_ratio
+        if aspect >= 1.0:
+            half_x = 0.9
+            half_y = 0.9 / aspect
+        else:
+            half_x = 0.9 * aspect
+            half_y = 0.9
 
-        v = length_x_m / length_y_m
-        scale = (
-            np.pi**2
-            / (length_x_m * length_y_m)
-            * np.sqrt(flexural_rigidity / (density * thickness_m))
-        )
+        axis = np.linspace(-1.0, 1.0, n, dtype=np.float64)
+        x, y = np.meshgrid(axis, axis, indexing="xy")
+        u = (x / half_x + 1.0) * 0.5
+        v = (y / half_y + 1.0) * 0.5
+        inside = geometry.sdf <= 0.0
 
-        l = mode_indices[:, 0].astype(np.float64)
-        m = mode_indices[:, 1].astype(np.float64)
-        factors = l**2 + v * m**2
-        omega = scale * factors
-        frequencies = omega / (2.0 * np.pi)
-
-        return (
-            np.ascontiguousarray(factors, dtype=np.float64),
-            np.ascontiguousarray(frequencies, dtype=np.float64),
-        )
-
-    def _mode_shape_maps(self, mode_indices: np.ndarray) -> np.ndarray:
-        n = self.shape_grid_size
-        axis = np.linspace(0.0, 1.0, n, dtype=np.float64)
-        x_grid, y_grid = np.meshgrid(axis, axis, indexing="xy")
-
-        shapes = np.empty((mode_indices.shape[0], n, n), dtype=np.float64)
+        shapes = np.zeros((mode_indices.shape[0], n, n), dtype=np.float64)
         for k, (l, m) in enumerate(mode_indices):
-            shapes[k] = np.sin(l * np.pi * x_grid) * np.sin(m * np.pi * y_grid)
+            values = np.sin(l * np.pi * u) * np.sin(m * np.pi * v)
+            shapes[k, inside] = values[inside]
         return np.ascontiguousarray(shapes)
 
-    def predict(self, params: SynthParameters) -> ModalBasis:
-        mode_indices = self.legacy_mode_indices(params.legacy_mode_order)
-        factors, frequencies = self.legacy_frequencies_hz(
-            mode_indices=mode_indices,
-            length_x_m=params.length_x_m,
-            length_y_m=params.length_y_m,
-            flexural_rigidity=params.flexural_rigidity,
-            density=params.density,
-            thickness_m=params.thickness_m,
-        )
+    def predict(self, geometry: GeometryDescription, n_modes: int) -> ModalBasis:
+        if geometry.kind != "rectangle":
+            raise ValueError("LegacyRectangleBackend only supports rectangles")
 
-        mode_shapes = self._mode_shape_maps(mode_indices)
-        grid_size = self.shape_grid_size
+        indices = self.legacy_mode_indices(n_modes)
+        l = indices[:, 0].astype(np.float64)
+        m = indices[:, 1].astype(np.float64)
 
-        # The Phase-1 legacy geometry is a full canonical rectangle.
-        # Negative-inside SDF convention is reserved for the future geometry
-        # generator; for now this simple field is sufficient as metadata.
-        geometry_sdf = -np.ones((grid_size, grid_size), dtype=np.float64)
-        integration_weights = np.full(
-            (grid_size, grid_size),
-            1.0 / (grid_size * grid_size),
-            dtype=np.float64,
-        )
+        # Exact geometry-dependent factor used by v12. Material and absolute
+        # scale are deliberately not applied here.
+        factors = l**2 + geometry.aspect_ratio * m**2
+        shapes = self._mode_shape_maps(indices, geometry)
+
+        inside = (geometry.sdf <= 0.0).astype(np.float64)
+        total = float(np.sum(inside))
+        weights = inside / total if total > 0.0 else inside
 
         return ModalBasis(
-            modal_factors=factors,
-            frequencies_hz=frequencies,
-            mode_shapes=mode_shapes,
-            geometry_sdf=np.ascontiguousarray(geometry_sdf),
-            integration_weights=np.ascontiguousarray(integration_weights),
-            legacy_mode_indices=mode_indices,
+            modal_factors=np.ascontiguousarray(factors, dtype=np.float64),
+            mode_shapes=shapes,
+            geometry_sdf=np.ascontiguousarray(geometry.sdf, dtype=np.float64),
+            integration_weights=np.ascontiguousarray(weights, dtype=np.float64),
+            legacy_mode_indices=indices,
         )
+
+
+def resolve_modal_frequencies_hz(
+    basis: ModalBasis,
+    params: SynthParameters,
+) -> np.ndarray:
+    """Apply physical size/material scaling and musical tuning outside the backend.
+
+    This preserves the v12 rectangle expression:
+        omega = pi^2/(Lx*Ly) * sqrt(D/(rho*H)) * modal_factor
+    while keeping D, rho, H and frequency_scale out of the modal predictor.
+    """
+    if min(
+        params.length_x_m,
+        params.length_y_m,
+        params.flexural_rigidity,
+        params.density,
+        params.thickness_m,
+        params.frequency_scale,
+    ) <= 0.0:
+        raise ValueError("physical dimensions/material/frequency_scale must be > 0")
+
+    scale = (
+        np.pi**2
+        / (params.length_x_m * params.length_y_m)
+        * np.sqrt(params.flexural_rigidity / (params.density * params.thickness_m))
+    )
+    omega = scale * np.asarray(basis.modal_factors, dtype=np.float64)
+    frequencies = omega / (2.0 * np.pi)
+    frequencies *= float(params.frequency_scale)
+    return np.ascontiguousarray(frequencies, dtype=np.float64)

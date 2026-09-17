@@ -5,19 +5,20 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class SynthParameters:
-    """Immutable control state shared between the GUI and audio engine.
+    """Immutable control state for the realtime synth.
 
-    The fields deliberately separate physical/material controls from the
-    nonlinear resonator controls. The future neural network will only replace
-    the geometry -> modal-basis step; these parameters remain ordinary code.
+    Geometry, physical/material scaling, damping/tuning, spatial controls and
+    nonlinear coupling are kept explicit so the future neural backend only has
+    to learn geometry -> modal basis.
     """
 
-    # Runtime
+    # Runtime. sample_rate is intentionally immutable after AudioEngine init.
     sample_rate: float = 48_000.0
-    legacy_mode_order: int = 10
+    n_modes: int = 90
     max_state_magnitude: float = 10.0
 
-    # Rectangle reference geometry used by the Phase-1 legacy backend
+    # Phase-1 rectangle geometry. Absolute scale and aspect are resolved
+    # outside the modal backend; the backend receives a normalized geometry.
     length_x_m: float = 1.0
     length_y_m: float = 1.0
 
@@ -28,7 +29,7 @@ class SynthParameters:
     alpha_g: float = 0.3322
     alpha_r: float = 4e-5
 
-    # Musical tuning kept outside the future NN
+    # Musical tuning, applied after physical frequency scaling.
     frequency_scale: float = 1.0
 
     # Nonlinear coupling
@@ -40,14 +41,13 @@ class SynthParameters:
     strike_x: float = 0.3
     strike_y: float = 0.3
     excitation_length_samples: int = 192
-    excitation_mode: int = 0  # 0 = short sin^2 impact, 1 = 1 Hz impulses
+    excitation_mode: int = 0
     excitation_amplitude: float = 1.0
 
-    # Output pickup. Disabled reproduces the v12 equal-weight output.
+    # Output pickup. Disabled reproduces the v12 equal-weight readout.
     pickup_enabled: bool = False
     pickup_x: float = 0.70
     pickup_y: float = 0.70
 
     def updated(self, **changes: object) -> "SynthParameters":
-        """Return a new immutable parameter object with selected fields changed."""
         return replace(self, **changes)
