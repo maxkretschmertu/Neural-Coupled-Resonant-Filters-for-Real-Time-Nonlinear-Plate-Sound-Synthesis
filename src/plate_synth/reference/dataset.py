@@ -7,7 +7,7 @@ import json
 from math import ceil, log2, sqrt
 from pathlib import Path
 import traceback
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
@@ -62,6 +62,20 @@ class DatasetConfig:
             raise ValueError("boundary_samples must be >= 64")
         if self.mesh_edge_length <= 0.0 or self.shard_size < 1:
             raise ValueError("mesh_edge_length and shard_size must be positive")
+        if not (-1.0 < self.poisson_ratio < 0.5):
+            raise ValueError("poisson_ratio must lie in (-1, 0.5)")
+        if self.boundary_condition != "simply_supported":
+            raise ValueError("Phase 3 currently supports simply_supported only")
+        if self.integration_order < 2 or self.eigensolver_maxiter < 1:
+            raise ValueError("invalid integration/eigensolver settings")
+        if self.eigensolver_tolerance <= 0.0 or self.degeneracy_relative_gap < 0.0:
+            raise ValueError("invalid eigensolver/degeneracy tolerance")
+        if min(
+            self.max_residual,
+            self.max_mass_orthogonality_error,
+            self.max_grid_norm_error,
+        ) <= 0.0:
+            raise ValueError("quality thresholds must be positive")
 
 
 @dataclass(frozen=True)
@@ -123,9 +137,12 @@ def build_sample_specs(config: DatasetConfig) -> list[SampleSpec]:
     # the training set without increasing its requested size.
     anchors = np.asarray(
         [
-            (0.0, 0.0), (0.0, 1.0),
-            (0.5, 0.0), (0.5, 1.0),
-            (1.0, 0.0), (1.0, 1.0),
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (0.5, 0.0),
+            (0.5, 1.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
         ],
         dtype=np.float64,
     )
@@ -159,7 +176,9 @@ def _solver_config(config: DatasetConfig) -> PlateSolverConfig:
     )
 
 
-def _generate_one(payload: tuple[DatasetConfig, SampleSpec]) -> GeneratedSample | FailedSample:
+def _generate_one(
+    payload: tuple[DatasetConfig, SampleSpec],
+) -> GeneratedSample | FailedSample:
     config, spec = payload
     try:
         geometry = make_geometry(
@@ -209,11 +228,19 @@ class _ShardWriter:
         self.split = split
         self.config = config
         self.root.mkdir(parents=True, exist_ok=True)
+        # Only finalized .h5 files participate in resume. A process crash may
+        # leave a .partial.h5; discard it instead of treating it as valid data.
+        for partial in self.root.glob(f"{split}_*.partial.h5"):
+            partial.unlink(missing_ok=True)
         existing = sorted(self.root.glob(f"{split}_*.h5"))
         self.next_index = 0
         if existing:
-            self.next_index = max(int(path.stem.split("_")[-1]) for path in existing) + 1
+            self.next_index = max(
+                int(path.stem.split("_")[-1]) for path in existing
+            ) + 1
         self._file = None
+        self._final_path: Path | None = None
+        self._partial_path: Path | None = None
         self._datasets: dict[str, Any] = {}
         self._count = 0
 
@@ -223,20 +250,33 @@ class _ShardWriter:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("HDF5 output requires h5py") from exc
 
-        path = self.root / f"{self.split}_{self.next_index:05d}.h5"
+        final_path = self.root / f"{self.split}_{self.next_index:05d}.h5"
+        partial_path = self.root / f"{self.split}_{self.next_index:05d}.partial.h5"
         self.next_index += 1
-        f = h5py.File(path, "w")
+        f = h5py.File(partial_path, "w")
         f.attrs["dataset_version"] = self.config.version
         f.attrs["split"] = self.split
         f.attrs["boundary_condition"] = self.config.boundary_condition
         f.attrs["poisson_ratio"] = self.config.poisson_ratio
         f.attrs["n_modes"] = self.config.n_modes
-        f.attrs["modal_factor_convention"] = "sqrt(kirchhoff_dimensionless_eigenvalue)"
+        f.attrs["n_solve"] = self.config.n_solve
+        f.attrs["modal_factor_convention"] = (
+            "sqrt(kirchhoff_dimensionless_eigenvalue)"
+        )
         self._file = f
+        self._final_path = final_path
+        self._partial_path = partial_path
         self._datasets = {}
         self._count = 0
 
-    def _dataset(self, name: str, sample_shape: tuple[int, ...], dtype: Any, *, compress: bool = True):
+    def _dataset(
+        self,
+        name: str,
+        sample_shape: tuple[int, ...],
+        dtype: Any,
+        *,
+        compress: bool = True,
+    ):
         if name in self._datasets:
             return self._datasets[name]
         assert self._file is not None
@@ -283,16 +323,34 @@ class _ShardWriter:
         self._append_array(
             "inner_product_weights", sampled.inner_product_weights, np.float32
         )
-        self._append_array("degenerate_group_id", sampled.degenerate_group_id, np.int16)
-        self._append_array("eigensolver_residual", sampled.residuals, np.float64)
+        self._append_array(
+            "degenerate_group_id", sampled.degenerate_group_id, np.int16
+        )
+        self._append_array("mode_loss_mask", sampled.mode_loss_mask, np.float32)
         self._append_scalar(
-            "mass_orthogonality_error", sample.mass_orthogonality_error, np.float64
+            "cutoff_group_complete", int(sampled.cutoff_group_complete), np.uint8
+        )
+        self._append_array(
+            "eigensolver_residual", sampled.residuals, np.float64
+        )
+        self._append_scalar(
+            "mass_orthogonality_error",
+            sample.mass_orthogonality_error,
+            np.float64,
         )
         self._append_scalar("mesh_n_vertices", sample.mesh.n_vertices, np.int32)
-        self._append_scalar("mesh_n_triangles", sample.mesh.n_triangles, np.int32)
-        self._append_scalar("mesh_h_min", sample.mesh.min_edge_length, np.float32)
-        self._append_scalar("mesh_h_mean", sample.mesh.mean_edge_length, np.float32)
-        self._append_scalar("mesh_h_max", sample.mesh.max_edge_length, np.float32)
+        self._append_scalar(
+            "mesh_n_triangles", sample.mesh.n_triangles, np.int32
+        )
+        self._append_scalar(
+            "mesh_h_min", sample.mesh.min_edge_length, np.float32
+        )
+        self._append_scalar(
+            "mesh_h_mean", sample.mesh.mean_edge_length, np.float32
+        )
+        self._append_scalar(
+            "mesh_h_max", sample.mesh.max_edge_length, np.float32
+        )
 
         if self.config.store_mesh:
             try:
@@ -323,7 +381,11 @@ class _ShardWriter:
         if self._file is not None:
             self._file.flush()
             self._file.close()
+            if self._partial_path is not None and self._final_path is not None:
+                self._partial_path.replace(self._final_path)
         self._file = None
+        self._final_path = None
+        self._partial_path = None
         self._datasets = {}
         self._count = 0
 
@@ -335,15 +397,23 @@ def _completed_ids(root: Path) -> set[str]:
         raise RuntimeError("resume scanning requires h5py") from exc
     done: set[str] = set()
     for path in root.glob("*_*.h5"):
+        if path.name.endswith(".partial.h5"):
+            continue
         with h5py.File(path, "r") as f:
             if "sample_id" not in f:
                 continue
             for raw in f["sample_id"][:]:
-                done.add(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
+                done.add(
+                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                )
     return done
 
 
-def _write_manifest(root: Path, config: DatasetConfig, extra: dict[str, Any]) -> None:
+def _write_manifest(
+    root: Path,
+    config: DatasetConfig,
+    extra: dict[str, Any],
+) -> None:
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "config": asdict(config),
@@ -371,13 +441,21 @@ def generate_dataset(
     completed = _completed_ids(root)
     pending = [spec for spec in specs if spec.sample_id not in completed]
 
-    writers = {split: _ShardWriter(root, split, config) for split in ("train", "val", "test")}
+    writers = {
+        split: _ShardWriter(root, split, config)
+        for split in ("train", "val", "test")
+    }
     failed_path = root / "failed_samples.jsonl"
-    counts = {"written": 0, "failed": 0, "skipped": len(specs) - len(pending)}
+    counts = {
+        "written": 0,
+        "failed": 0,
+        "skipped": len(specs) - len(pending),
+    }
 
     requested_workers = config.workers if workers is None else workers
     if requested_workers is None or requested_workers <= 0:
         import os
+
         requested_workers = max(1, (os.cpu_count() or 2) - 1)
 
     _write_manifest(
@@ -413,18 +491,21 @@ def generate_dataset(
                 consume(_generate_one((config, spec)))
         else:
             with ProcessPoolExecutor(max_workers=requested_workers) as pool:
-                futures = [pool.submit(_generate_one, (config, spec)) for spec in pending]
+                futures = [
+                    pool.submit(_generate_one, (config, spec)) for spec in pending
+                ]
                 for future in as_completed(futures):
                     consume(future.result())
     finally:
         for writer in writers.values():
             writer.close()
 
+    final_status = "complete" if counts["failed"] == 0 else "complete_with_failures"
     _write_manifest(
         root,
         config,
         {
-            "status": "complete",
+            "status": final_status,
             "requested_samples": len(specs),
             **counts,
         },
