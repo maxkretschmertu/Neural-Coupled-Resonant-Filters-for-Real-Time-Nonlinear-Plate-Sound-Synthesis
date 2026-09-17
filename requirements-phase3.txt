@@ -1,0 +1,7 @@
+# Offline Phase-3 reference solver / dataset generation only.
+# The realtime synth does not need these additional dependencies.
+scipy>=1.12
+scikit-fem>=12.0.1,<13
+gmsh>=4.11
+h5py>=3.11
+matplotlib>=3.8
