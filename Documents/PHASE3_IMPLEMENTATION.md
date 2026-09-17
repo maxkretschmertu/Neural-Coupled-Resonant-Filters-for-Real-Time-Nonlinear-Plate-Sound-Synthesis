@@ -69,7 +69,7 @@ pip install -r requirements-phase3.txt
 - `reference/mesh.py`: Gmsh polygon meshing, edge statistics, mesh-area error and an approximate symmetric boundary Hausdorff distance against the Phase-2 target contour.
 - `reference/plate_solver.py`: Morley Kirchhoff eigenproblem, simply-supported BC, FEM mass normalization, residuals and orthogonality QA.
 - `reference/mode_sampling.py`: FEM displacement modes sampled on the canonical material grid, target normalization, sign convention, degeneracy groups, cutoff loss masks and raw grid-quadrature diagnostics.
-- `reference/validation.py`: frequency-aware Hungarian reference matching, MAC/subspace tools and hard per-sample QA gates.
+- `reference/validation.py`: frequency+shape Hungarian reference matching, MAC/subspace tools and hard per-sample QA gates.
 - `reference/dataset.py`: deterministic disjoint splits, multiprocessing, HDF5 sharding, config fingerprints, safe resume, manifest and failure logging.
 
 ## Solver validation must precede full generation
@@ -80,9 +80,14 @@ Run:
 python tools/validate_plate_solver.py
 ```
 
-The validation covers rectangle aspect ratios 1, 1.5, 2, 3 and 4 over several mesh sizes. Raw eigensolver indices are **not** trusted. FEM modes are assigned to analytical reference modes with a Hungarian solve whose cost is led by relative modal-factor error with only a small MAC tie-break term. This makes close numerical mode swaps harmless. Within repeated/near-repeated analytical groups, selected FEM factors are sorted before scalar convergence comparisons so arbitrary eigensolver order does not create fake convergence jumps.
+The validation covers rectangle aspect ratios 1, 1.5, 2, 3 and 4 over several mesh sizes. Raw eigensolver indices are **not** trusted. FEM modes are assigned to analytical reference modes with a Hungarian solve using both relative modal-factor error and weighted MAC. The default shape weight is intentionally non-negligible (`0.25`) because a finite mesh can move two close eigenvalues past one another by more than their exact analytical spacing.
 
-Nondegenerate reference modes use weighted MAC after matching. Degenerate analytical eigenspaces use a basis-invariant subspace projection score on the full matched eigenspace, so a physically equivalent rotation inside a repeated eigenspace is not incorrectly penalized.
+There are two separate grouping concepts:
+
+- `--degeneracy-gap` (default `5e-4`) describes genuinely repeated/near-repeated eigenvalues for the physical dataset contract.
+- `--comparison-group-gap` (default `0.02` in modal-factor space) is broader and is used **only by the validation tool**. If neighbouring analytical modes are closer than the current numerical resolution, their finite-mesh eigenvectors can rotate/cross while the combined eigenspace is still correct. Such a comparison band is validated with a basis-invariant subspace score instead of individual MAC values.
+
+The broader validation grouping does **not** alter the stored `degenerate_group_id`, `mode_loss_mask`, or the Phase-4 training contract.
 
 The tool writes:
 
@@ -91,7 +96,7 @@ validation/phase3/rectangle_frequency_shape.csv
 validation/phase3/mesh_convergence.csv
 ```
 
-`rectangle_frequency_shape.csv` records both the reference mode and the matched FEM mode index.
+`rectangle_frequency_shape.csv` records both the reference mode and the matched FEM mode index. The validator also prints the eight worst finest-mesh shape comparisons with score kind, comparison-band size and frequency error.
 
 The validator exits with code 1 if the configured hard gates fail. Default gates include:
 
@@ -102,7 +107,7 @@ The validator exits with code 1 if the configured hard gates fail. Default gates
 - mesh/target relative area error 0.5%,
 - approximate boundary distance 0.01 in normalized coordinates.
 
-These are acceptance gates, not claims that the supplied `mesh_edge_length=0.055` will automatically satisfy them. If validation fails, refine the mesh/config and rerun validation before generating labels. A useful focused convergence run is:
+These are acceptance gates, not claims that a particular mesh edge length automatically satisfies them. If validation fails, refine the mesh/config and rerun validation before generating labels. A useful focused convergence run is:
 
 ```bash
 python tools/validate_plate_solver.py --aspects 1 --h 0.055 0.04 0.028 0.02
@@ -191,13 +196,15 @@ First run the cheap/unit checks:
 python tests/test_phase3.py
 ```
 
-The optional real Gmsh/scikit-fem integration test is reported as `SKIP` unless `PLATE_SYNTH_RUN_FEM_TESTS=1` is set. Use the shell-appropriate syntax:
+The optional real Gmsh/scikit-fem integration test is reported as `SKIP` unless `PLATE_SYNTH_RUN_FEM_TESTS=1` is set. Use the shell-appropriate syntax.
 
 **Windows cmd.exe / Anaconda Prompt**
 
 ```bat
-set PLATE_SYNTH_RUN_FEM_TESTS=1 && python tests/test_phase3.py
+set "PLATE_SYNTH_RUN_FEM_TESTS=1" && python tests/test_phase3.py
 ```
+
+The quoted `set "NAME=value"` form is intentional: it prevents whitespace before `&&` from becoming part of the environment-variable value.
 
 **PowerShell**
 
@@ -218,7 +225,7 @@ Then validate the solver:
 python tools/validate_plate_solver.py
 ```
 
-Start with a small smoke generation:
+Start with a small smoke generation only after validation passes:
 
 ```bash
 python tools/generate_modal_dataset.py \
