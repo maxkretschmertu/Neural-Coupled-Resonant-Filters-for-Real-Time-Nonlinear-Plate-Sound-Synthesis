@@ -10,11 +10,14 @@ from .geometry import GeometryDescription, boundary_radius_at
 class MaterialGrid:
     """Fixed canonical unit-disk grid mapped onto a current plate geometry.
 
-    `area_weights` approximate dA on the normalized plate geometry and are
-    rescaled to integrate to `geometry.area` exactly. `inner_product_weights`
-    are the same quadrature normalized to sum to one; they are convenient for
-    mode normalization, MAC-like comparisons and basis projection. They are
-    not physical mass weights.
+    ``raw_area_integral`` is the uncorrected Cartesian-grid quadrature of the
+    mapped unit disk.  ``raw_area_relative_error`` therefore exposes the actual
+    quadrature error instead of hiding it behind normalization.
+
+    ``area_weights`` are rescaled to integrate to ``geometry.area`` exactly and
+    are the weights used for geometric integrals. ``inner_product_weights`` are
+    those weights normalized to one for modal normalization, MAC and basis
+    projection.  None of these weights includes rho*H.
     """
 
     u: np.ndarray
@@ -26,6 +29,8 @@ class MaterialGrid:
     physical_y: np.ndarray
     area_weights: np.ndarray
     inner_product_weights: np.ndarray
+    raw_area_integral: float
+    raw_area_relative_error: float
 
     @property
     def grid_size(self) -> int:
@@ -56,8 +61,15 @@ def make_material_grid(geometry: GeometryDescription, grid_size: int = 64) -> Ma
     if raw_total <= 0.0:
         raise ValueError("material grid has zero area")
 
-    area_weights = raw_area_weights * (float(geometry.area) / raw_total)
-    inner_product_weights = area_weights / float(geometry.area)
+    target_area = float(geometry.area)
+    if target_area <= 0.0:
+        raise ValueError("geometry area must be positive")
+    raw_area_relative_error = abs(raw_total - target_area) / target_area
+
+    # Renormalized weights are intentionally retained for stable modal inner
+    # products, while the unrenormalized error is carried separately for QA.
+    area_weights = raw_area_weights * (target_area / raw_total)
+    inner_product_weights = area_weights / target_area
 
     return MaterialGrid(
         u=np.ascontiguousarray(u),
@@ -69,6 +81,8 @@ def make_material_grid(geometry: GeometryDescription, grid_size: int = 64) -> Ma
         physical_y=np.ascontiguousarray(y),
         area_weights=np.ascontiguousarray(area_weights),
         inner_product_weights=np.ascontiguousarray(inner_product_weights),
+        raw_area_integral=raw_total,
+        raw_area_relative_error=float(raw_area_relative_error),
     )
 
 
