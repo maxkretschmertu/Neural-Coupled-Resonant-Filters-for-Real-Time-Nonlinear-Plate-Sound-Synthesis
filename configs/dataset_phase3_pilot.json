@@ -1,6 +1,6 @@
 {
-  "version": "phase3-v2-pilot",
-  "output_dir": "data/modal_dataset_pilot",
+  "version": "phase3-v3-pilot",
+  "output_dir": "data/modal_dataset_phase3_v3_pilot",
   "seed": 20260917,
   "train_count": 256,
   "val_count": 64,
@@ -12,7 +12,7 @@
   "n_solve": 40,
   "poisson_ratio": 0.30,
   "boundary_condition": "simply_supported",
-  "mesh_edge_length": 0.055,
+  "mesh_edge_length": 0.02,
   "integration_order": 4,
   "eigensolver_tolerance": 1e-10,
   "eigensolver_maxiter": 30000,
