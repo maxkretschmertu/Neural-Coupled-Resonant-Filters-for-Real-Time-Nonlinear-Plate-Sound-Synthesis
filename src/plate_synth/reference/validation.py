@@ -24,6 +24,21 @@ class SampleQualityReport:
     boundary_hausdorff_approx: float
 
 
+@dataclass(frozen=True)
+class ReferenceModeMatch:
+    """One-to-one FEM -> analytical/reference mode assignment.
+
+    ``fem_for_reference[j]`` is the FEM mode index assigned to reference mode
+    ``j``.  The assignment is frequency-led, with weighted MAC used only as a
+    small shape tie-breaker so close numerical crossings do not make validation
+    depend on raw eigensolver ordering.
+    """
+
+    fem_for_reference: np.ndarray
+    pair_relative_error: np.ndarray
+    mac_matrix: np.ndarray
+
+
 def modal_assurance_matrix(
     modes_a: np.ndarray,
     modes_b: np.ndarray,
@@ -64,6 +79,98 @@ def subspace_projection_score(
     qb, _ = np.linalg.qr(sqrt_w * b)
     singular = np.linalg.svd(qa.T @ qb, compute_uv=False)
     return float(np.mean(np.clip(singular, 0.0, 1.0) ** 2))
+
+
+def match_modes_to_reference(
+    fem_factors: np.ndarray,
+    fem_modes: np.ndarray,
+    reference_factors: np.ndarray,
+    reference_modes: np.ndarray,
+    weights: np.ndarray,
+    *,
+    shape_tiebreak_weight: float = 1e-3,
+) -> ReferenceModeMatch:
+    """Match FEM modes to a reference basis without trusting raw mode order.
+
+    The Hungarian assignment minimizes
+
+        relative_frequency_error + eps * (1 - MAC)
+
+    where ``eps`` is intentionally small.  Frequency therefore defines modal
+    identity for the rectangle validation while MAC only resolves close/tied
+    choices.  Repeated reference eigenspaces are evaluated later as complete
+    subspaces; the within-group assignment is physically irrelevant.
+    """
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as exc:  # pragma: no cover - phase-3 dependency
+        raise RuntimeError("mode matching requires scipy") from exc
+
+    fem_f = np.asarray(fem_factors, dtype=np.float64)
+    ref_f = np.asarray(reference_factors, dtype=np.float64)
+    fem_shapes = np.asarray(fem_modes, dtype=np.float64)
+    ref_shapes = np.asarray(reference_modes, dtype=np.float64)
+
+    if fem_f.ndim != 1 or ref_f.ndim != 1:
+        raise ValueError("modal factors must be 1D")
+    if fem_shapes.ndim != 3 or ref_shapes.ndim != 3:
+        raise ValueError("mode maps must have shape (N,H,W)")
+    if fem_shapes.shape[0] != fem_f.size or ref_shapes.shape[0] != ref_f.size:
+        raise ValueError("factor and mode-map counts must match")
+    if fem_f.size < ref_f.size:
+        raise ValueError("need at least as many FEM modes as reference modes")
+    if np.any(ref_f <= 0.0) or not np.all(np.isfinite(ref_f)):
+        raise ValueError("reference factors must be positive and finite")
+    if np.any(fem_f <= 0.0) or not np.all(np.isfinite(fem_f)):
+        raise ValueError("FEM factors must be positive and finite")
+    if shape_tiebreak_weight < 0.0:
+        raise ValueError("shape_tiebreak_weight must be non-negative")
+
+    mac = modal_assurance_matrix(fem_shapes, ref_shapes, weights)
+    relative = np.abs(fem_f[:, None] / ref_f[None, :] - 1.0)
+    cost = relative + float(shape_tiebreak_weight) * (1.0 - mac)
+    rows, cols = linear_sum_assignment(cost)
+
+    assignment = np.full(ref_f.size, -1, dtype=np.int64)
+    assignment[cols] = rows
+    if np.any(assignment < 0):
+        raise RuntimeError("Hungarian assignment did not cover every reference mode")
+
+    pair_error = relative[assignment, np.arange(ref_f.size)]
+    return ReferenceModeMatch(
+        fem_for_reference=np.ascontiguousarray(assignment),
+        pair_relative_error=np.ascontiguousarray(pair_error),
+        mac_matrix=np.ascontiguousarray(mac),
+    )
+
+
+def reorder_match_within_reference_groups(
+    fem_factors: np.ndarray,
+    fem_for_reference: np.ndarray,
+    reference_group_ids: np.ndarray,
+) -> np.ndarray:
+    """Make factor ordering deterministic inside repeated/near-repeated groups.
+
+    Subspace scores do not care which vector represents which member of a
+    repeated eigenspace, but mesh-convergence tables compare scalar modal
+    factors.  Sorting the selected FEM factors inside each reference group
+    prevents arbitrary eigensolver basis/order changes from creating fake
+    convergence jumps.
+    """
+    factors = np.asarray(fem_factors, dtype=np.float64)
+    assignment = np.asarray(fem_for_reference, dtype=np.int64).copy()
+    groups = np.asarray(reference_group_ids)
+    if assignment.ndim != 1 or groups.shape != assignment.shape:
+        raise ValueError("assignment and reference_group_ids must be matching 1D arrays")
+    if np.any(assignment < 0) or np.any(assignment >= factors.size):
+        raise ValueError("assignment contains invalid FEM indices")
+
+    for group_id in np.unique(groups):
+        ref_indices = np.flatnonzero(groups == group_id)
+        selected = assignment[ref_indices]
+        order = np.argsort(factors[selected], kind="stable")
+        assignment[ref_indices] = selected[order]
+    return np.ascontiguousarray(assignment)
 
 
 def validate_generated_sample(
