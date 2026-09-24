@@ -148,6 +148,90 @@ def solve_plate(
         free_dofs,
     )
 
+def evaluate_mode_gains(
+    basis,
+    eigenvectors,
+    free_dofs,
+    points,
+    normalize=True,
+):
+    points = np.asarray(
+        points,
+        dtype=np.float64,
+    )
+
+    if points.ndim == 1:
+        points = points[None, :]
+
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+    ):
+        raise ValueError(
+            "points must have shape (N, 2)"
+        )
+
+    n_modes = (
+        eigenvectors.shape[1]
+    )
+
+    # eigsh() only returned the free DOFs.
+    # Reconstruct the complete Morley
+    # coefficient vector for every mode.
+    full_modes = np.zeros(
+        (
+            basis.N,
+            n_modes,
+        ),
+        dtype=np.float64,
+    )
+
+    full_modes[
+        free_dofs,
+        :
+    ] = eigenvectors
+
+    if normalize:
+        # Morley has one displacement DOF
+        # 'u' at every mesh vertex.
+        nodal_u_dofs = (
+            basis.nodal_dofs[0]
+        )
+
+        peak = np.max(
+            np.abs(
+                full_modes[
+                    nodal_u_dofs,
+                    :
+                ]
+            ),
+            axis=0,
+        )
+
+        peak = np.where(
+            peak > 1e-12,
+            peak,
+            1.0,
+        )
+
+        full_modes = (
+            full_modes
+            / peak[None, :]
+        )
+
+    probe_matrix = basis.probes(
+        points.T
+    )
+
+    gains = (
+        probe_matrix
+        @ full_modes
+    )
+
+    return np.asarray(
+        gains
+    )
+
 
 def mesh_from_mask(
     mask,

@@ -2,12 +2,12 @@ import time
 import numpy as np
 
 from shapes import (
-    make_morph_mask,
-    morph_sdf,
+    make_morph_contour,
+    contour_to_mask,
 )
 
 from plate_reference import (
-    mesh_from_sdf,
+    mesh_from_contour,
     solve_plate,
 )
 
@@ -15,10 +15,9 @@ from plate_reference import (
 N_MODES = 32
 
 NN_RESOLUTION = 64
-SDF_RESOLUTION = 512
+CONTOUR_POINTS = 512
 
 MAX_AREA = 0.00025
-SIMPLIFY = 0.002
 POISSON = 0.3
 
 
@@ -26,26 +25,25 @@ def generate_sample(
     morph,
     aspect,
 ):
-    # Kleine Maske:
-    # das sieht später das Neural Network.
-    mask = make_morph_mask(
+    # Einmal die gemeinsame Geometrie erzeugen.
+    contour = make_morph_contour(
         morph=morph,
         aspect=aspect,
+        n_points=CONTOUR_POINTS,
+    )
+
+    # Genau dieselbe Geometrie wird für
+    # das 64x64-NN-Inputbild rasterisiert.
+    mask = contour_to_mask(
+        contour=contour,
         resolution=NN_RESOLUTION,
+        supersample=4,
     )
 
-    # Hochauflösende Geometrie:
-    # nur für die Ground-Truth-Berechnung.
-    sdf = morph_sdf(
-        morph=morph,
-        aspect=aspect,
-        resolution=SDF_RESOLUTION,
-    )
-
-    mesh = mesh_from_sdf(
-        sdf,
+    # Und dieselbe Kontur geht ins FEM.
+    mesh = mesh_from_contour(
+        contour,
         max_area=MAX_AREA,
-        simplify=SIMPLIFY,
     )
 
     (
@@ -78,7 +76,9 @@ if __name__ == "__main__":
     morphs = []
     aspects = []
 
-    start_total = time.perf_counter()
+    start_total = (
+        time.perf_counter()
+    )
 
     for i in range(N_SAMPLES):
         morph = rng.uniform(
@@ -91,13 +91,16 @@ if __name__ == "__main__":
             2.0,
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
-        mask, modal_factors = (
-            generate_sample(
-                morph=morph,
-                aspect=aspect,
-            )
+        (
+            mask,
+            modal_factors,
+        ) = generate_sample(
+            morph=morph,
+            aspect=aspect,
         )
 
         elapsed = (
@@ -155,6 +158,7 @@ if __name__ == "__main__":
     )
 
     print()
+
     print(
         "masks:",
         masks.shape,
@@ -173,6 +177,13 @@ if __name__ == "__main__":
     print(
         "aspects:",
         aspects.shape,
+    )
+
+    print(
+        f"mask range: "
+        f"{masks.min():.3f} "
+        f"... "
+        f"{masks.max():.3f}"
     )
 
     print(

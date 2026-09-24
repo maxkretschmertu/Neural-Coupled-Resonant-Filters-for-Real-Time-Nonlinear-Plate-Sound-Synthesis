@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from skimage.measure import points_in_poly
 
 
 DEFAULT_RESOLUTION = 64
@@ -296,78 +297,21 @@ def make_morph_mask(
     morph,
     aspect=1.0,
     resolution=DEFAULT_RESOLUTION,
+    supersample=4,
+    contour_points=512,
 ):
-    sdf = morph_sdf(
+    contour = make_morph_contour(
         morph=morph,
         aspect=aspect,
-        resolution=resolution,
+        n_points=contour_points,
     )
 
-    return (
-        sdf >= 0.0
-    ).astype(np.float32)
+    return contour_to_mask(
+        contour=contour,
+        resolution=resolution,
+        supersample=supersample,
+    )
 
-
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-
-    aspect = 1.0
-    resolution = 128
-
-    morph_values = [
-        0.0,
-        0.25,
-        0.5,
-        0.75,
-        1.0,
-    ]
-
-    for morph in morph_values:
-        sdf = morph_sdf(
-            morph=morph,
-            aspect=aspect,
-            resolution=resolution,
-        )
-
-        mask = make_morph_mask(
-            morph=morph,
-            aspect=aspect,
-            resolution=resolution,
-        )
-
-        fig, axes = plt.subplots(
-            1,
-            2,
-            figsize=(8, 4),
-        )
-
-        axes[0].imshow(
-            sdf,
-            origin="lower",
-        )
-
-        axes[0].set_title(
-            f"SDF\nMorph = {morph:.2f}"
-        )
-
-        axes[0].axis("off")
-
-        axes[1].imshow(
-            mask,
-            origin="lower",
-            vmin=0.0,
-            vmax=1.0,
-        )
-
-        axes[1].set_title(
-            f"Mask\nMorph = {morph:.2f}"
-        )
-
-        axes[1].axis("off")
-
-        plt.tight_layout()
-
-    plt.show()
 
 def _shape_half_extents(aspect):
     max_half_size = 0.9
@@ -637,3 +581,120 @@ def make_morph_contour(
             y,
         )
     ).astype(np.float64)
+
+def contour_to_mask(
+    contour,
+    resolution=DEFAULT_RESOLUTION,
+    supersample=4,
+):
+    high_res = (
+        resolution
+        * supersample
+    )
+
+    coords = (
+        (np.arange(high_res) + 0.5)
+        / high_res
+        * 2.0
+        - 1.0
+    )
+
+    x, y = np.meshgrid(
+        coords,
+        coords,
+    )
+
+    points = np.column_stack(
+        (
+            x.ravel(),
+            y.ravel(),
+        )
+    )
+
+    inside = points_in_poly(
+        points,
+        contour,
+    )
+
+    high_res_mask = (
+        inside
+        .reshape(
+            high_res,
+            high_res,
+        )
+        .astype(np.float32)
+    )
+
+    mask = high_res_mask.reshape(
+        resolution,
+        supersample,
+        resolution,
+        supersample,
+    ).mean(
+        axis=(1, 3)
+    )
+
+    return mask.astype(
+        np.float32
+    )
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    aspect = 1.0
+    resolution = 128
+
+    morph_values = [
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+    ]
+
+    for morph in morph_values:
+        sdf = morph_sdf(
+            morph=morph,
+            aspect=aspect,
+            resolution=resolution,
+        )
+
+        mask = make_morph_mask(
+            morph=morph,
+            aspect=aspect,
+            resolution=resolution,
+        )
+
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=(8, 4),
+        )
+
+        axes[0].imshow(
+            sdf,
+            origin="lower",
+        )
+
+        axes[0].set_title(
+            f"SDF\nMorph = {morph:.2f}"
+        )
+
+        axes[0].axis("off")
+
+        axes[1].imshow(
+            mask,
+            origin="lower",
+            vmin=0.0,
+            vmax=1.0,
+        )
+
+        axes[1].set_title(
+            f"Mask\nMorph = {morph:.2f}"
+        )
+
+        axes[1].axis("off")
+
+        plt.tight_layout()
+
+    plt.show()
