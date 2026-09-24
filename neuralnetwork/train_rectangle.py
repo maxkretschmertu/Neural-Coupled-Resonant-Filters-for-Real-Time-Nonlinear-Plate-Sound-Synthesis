@@ -104,7 +104,7 @@ def train():
             gain_y,
         )
 
-        loss = factor_loss + 0.2 * gain_loss
+        loss = factor_loss + gain_loss
 
         optimizer.zero_grad()
         loss.backward()

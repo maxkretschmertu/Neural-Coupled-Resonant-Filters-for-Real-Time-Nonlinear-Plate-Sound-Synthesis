@@ -35,9 +35,11 @@ class ModalNet(nn.Module):
         )
 
         self.point_head = nn.Sequential(
-            nn.Linear(64 + 2, 64),
+            nn.Linear(2, 128),
             nn.ReLU(),
-            nn.Linear(64, n_modes),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_modes),
             nn.Tanh(),
         )
 
@@ -48,11 +50,7 @@ class ModalNet(nn.Module):
 
         log_factors = self.frequency_head(z)
 
-        point_input = torch.cat(
-            [z, point],
-            dim=1,
-        )
+        gains = self.point_head(point)
 
-        gains = self.point_head(point_input)
 
         return log_factors, gains
