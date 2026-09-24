@@ -337,6 +337,82 @@ def mesh_from_sdf(
 
     return mesh
 
+def mesh_from_contour(
+    vertices,
+    max_area=0.00025,
+):
+    vertices = np.asarray(
+        vertices,
+        dtype=np.float64,
+    )
+
+    if (
+        len(vertices) > 1
+        and np.allclose(
+            vertices[0],
+            vertices[-1],
+        )
+    ):
+        vertices = vertices[:-1]
+
+    n_vertices = len(
+        vertices
+    )
+
+    if n_vertices < 3:
+        raise ValueError(
+            "Contour has fewer than 3 vertices."
+        )
+
+    indices = np.arange(
+        n_vertices
+    )
+
+    segments = np.column_stack(
+        (
+            indices,
+            np.roll(
+                indices,
+                -1,
+            ),
+        )
+    )
+
+    geometry = {
+        "vertices": vertices,
+        "segments": segments,
+    }
+
+    options = (
+        "pq28"
+        f"a{max_area}"
+    )
+
+    triangulation = tr.triangulate(
+        geometry,
+        options,
+    )
+
+    if "triangles" not in triangulation:
+        raise RuntimeError(
+            "Triangle failed to create mesh."
+        )
+
+    mesh = MeshTri(
+        np.ascontiguousarray(
+            triangulation[
+                "vertices"
+            ].T
+        ),
+        np.ascontiguousarray(
+            triangulation[
+                "triangles"
+            ].T
+        ),
+    )
+
+    return mesh
+
 
 if __name__ == "__main__":
     N_MODES = 32

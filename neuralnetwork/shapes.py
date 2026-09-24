@@ -368,3 +368,272 @@ if __name__ == "__main__":
         plt.tight_layout()
 
     plt.show()
+
+def _shape_half_extents(aspect):
+    max_half_size = 0.9
+
+    if aspect >= 1.0:
+        half_width = max_half_size
+        half_height = max_half_size / aspect
+    else:
+        half_height = max_half_size
+        half_width = max_half_size * aspect
+
+    return half_width, half_height
+
+
+def _rectangle_radius(
+    theta,
+    half_width,
+    half_height,
+):
+    dx = np.cos(theta)
+    dy = np.sin(theta)
+
+    rx = np.full_like(
+        theta,
+        np.inf,
+    )
+
+    ry = np.full_like(
+        theta,
+        np.inf,
+    )
+
+    nonzero_x = (
+        np.abs(dx) > 1e-12
+    )
+
+    nonzero_y = (
+        np.abs(dy) > 1e-12
+    )
+
+    rx[nonzero_x] = (
+        half_width
+        / np.abs(dx[nonzero_x])
+    )
+
+    ry[nonzero_y] = (
+        half_height
+        / np.abs(dy[nonzero_y])
+    )
+
+    return np.minimum(
+        rx,
+        ry,
+    )
+
+
+def _ellipse_radius(
+    theta,
+    radius_x,
+    radius_y,
+):
+    dx = np.cos(theta)
+    dy = np.sin(theta)
+
+    denominator = np.sqrt(
+        (dx / radius_x) ** 2
+        + (dy / radius_y) ** 2
+    )
+
+    return 1.0 / denominator
+
+
+def _triangle_radius(
+    theta,
+    half_width,
+    half_height,
+):
+    dx = np.cos(theta)
+    dy = np.sin(theta)
+
+    # Triangle:
+    #
+    #          (0, +h)
+    #             /\
+    #            /  \
+    #           /    \
+    #   (-w,-h)------(w,-h)
+    #
+    # expressed as three half-plane constraints.
+
+    c1 = (
+        2.0 * dx / half_width
+        + dy / half_height
+    )
+
+    c2 = (
+        -2.0 * dx / half_width
+        + dy / half_height
+    )
+
+    c3 = (
+        -dy / half_height
+    )
+
+    radius = np.full_like(
+        theta,
+        np.inf,
+    )
+
+    for coefficient in (
+        c1,
+        c2,
+        c3,
+    ):
+        valid = coefficient > 1e-12
+
+        candidate = np.full_like(
+            theta,
+            np.inf,
+        )
+
+        candidate[valid] = (
+            1.0
+            / coefficient[valid]
+        )
+
+        radius = np.minimum(
+            radius,
+            candidate,
+        )
+
+    return radius
+
+
+def make_morph_contour(
+    morph,
+    aspect=1.0,
+    n_points=512,
+):
+    morph = float(
+        np.clip(
+            morph,
+            0.0,
+            1.0,
+        )
+    )
+
+    (
+        half_width,
+        half_height,
+    ) = _shape_half_extents(
+        aspect
+    )
+
+    # Uniform angular sampling.
+    theta = np.linspace(
+        0.0,
+        2.0 * np.pi,
+        n_points,
+        endpoint=False,
+    )
+
+    # Explicitly include rectangle
+    # and triangle corner directions.
+    rectangle_vertices = np.array(
+        [
+            [half_width, half_height],
+            [-half_width, half_height],
+            [-half_width, -half_height],
+            [half_width, -half_height],
+        ]
+    )
+
+    triangle_vertices = np.array(
+        [
+            [0.0, half_height],
+            [-half_width, -half_height],
+            [half_width, -half_height],
+        ]
+    )
+
+    critical_vertices = np.vstack(
+        (
+            rectangle_vertices,
+            triangle_vertices,
+        )
+    )
+
+    critical_theta = np.mod(
+        np.arctan2(
+            critical_vertices[:, 1],
+            critical_vertices[:, 0],
+        ),
+        2.0 * np.pi,
+    )
+
+    theta = np.sort(
+        np.unique(
+            np.concatenate(
+                (
+                    theta,
+                    critical_theta,
+                )
+            )
+        )
+    )
+
+    rectangle_radius = (
+        _rectangle_radius(
+            theta,
+            half_width,
+            half_height,
+        )
+    )
+
+    ellipse_radius = (
+        _ellipse_radius(
+            theta,
+            half_width,
+            half_height,
+        )
+    )
+
+    triangle_radius = (
+        _triangle_radius(
+            theta,
+            half_width,
+            half_height,
+        )
+    )
+
+    if morph <= 0.5:
+        amount = morph * 2.0
+
+        radius = (
+            (1.0 - amount)
+            * rectangle_radius
+            + amount
+            * ellipse_radius
+        )
+
+    else:
+        amount = (
+            morph - 0.5
+        ) * 2.0
+
+        radius = (
+            (1.0 - amount)
+            * ellipse_radius
+            + amount
+            * triangle_radius
+        )
+
+    x = (
+        radius
+        * np.cos(theta)
+    )
+
+    y = (
+        radius
+        * np.sin(theta)
+    )
+
+    return np.column_stack(
+        (
+            x,
+            y,
+        )
+    ).astype(np.float64)
