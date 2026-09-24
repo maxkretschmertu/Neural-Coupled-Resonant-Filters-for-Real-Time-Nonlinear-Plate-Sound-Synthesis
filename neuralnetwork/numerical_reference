@@ -1,0 +1,226 @@
+import numpy as np
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+import matplotlib.pyplot as plt
+
+
+def solve_shape_modes(
+    mask,
+    n_modes=32,
+    threshold=0.5,
+):
+    inside = mask >= threshold
+
+    ny, nx = inside.shape
+
+    if nx != ny:
+        raise ValueError("Mask must currently be square.")
+
+    h = 2.0 / nx
+
+    index = -np.ones(
+        (ny, nx),
+        dtype=np.int32,
+    )
+
+    index[inside] = np.arange(
+        np.count_nonzero(inside)
+    )
+
+    n_points = np.count_nonzero(inside)
+
+    rows = []
+    cols = []
+    data = []
+
+    inv_h2 = 1.0 / h**2
+
+    neighbours = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+    ]
+
+    for iy in range(ny):
+        for ix in range(nx):
+            if not inside[iy, ix]:
+                continue
+
+            i = index[iy, ix]
+
+            rows.append(i)
+            cols.append(i)
+            data.append(4.0 * inv_h2)
+
+            for dy, dx in neighbours:
+                jy = iy + dy
+                jx = ix + dx
+
+                if (
+                    0 <= jy < ny
+                    and 0 <= jx < nx
+                    and inside[jy, jx]
+                ):
+                    j = index[jy, jx]
+
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(-inv_h2)
+
+    laplacian = csr_matrix(
+        (data, (rows, cols)),
+        shape=(n_points, n_points),
+    )
+
+    eigenvalues, eigenvectors = eigsh(
+        laplacian,
+        k=n_modes,
+        sigma=0.0,
+        which="LM",
+    )
+
+    order = np.argsort(eigenvalues)
+
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    area = n_points * h**2
+
+    modal_factors = eigenvalues * area
+
+    mode_shapes = np.zeros(
+        (n_modes, ny, nx),
+        dtype=np.float32,
+    )
+
+    for k in range(n_modes):
+        mode = eigenvectors[:, k]
+
+        max_value = np.max(
+            np.abs(mode)
+        )
+
+        if max_value > 0.0:
+            mode = mode / max_value
+
+        mode_shapes[k][inside] = mode
+
+    return modal_factors, mode_shapes
+
+if __name__ == "__main__":
+    from shapes import (
+        make_rectangle_mask,
+        make_ellipse_mask,
+        make_triangle_mask,
+    )
+
+    N_MODES = 32
+    RESOLUTION = 128
+    ASPECT = 1.0
+
+    shapes = {
+        "Rectangle": make_rectangle_mask(
+            aspect=ASPECT,
+            resolution=RESOLUTION,
+        ),
+        "Ellipse": make_ellipse_mask(
+            aspect=ASPECT,
+            resolution=RESOLUTION,
+        ),
+        "Triangle": make_triangle_mask(
+            aspect=ASPECT,
+            resolution=RESOLUTION,
+        ),
+    }
+
+    for name, mask in shapes.items():
+        modal_factors, mode_shapes = solve_shape_modes(
+            mask,
+            n_modes=N_MODES,
+        )
+
+        print(f"\n{name}")
+        print("-" * len(name))
+
+        print("Modal factors:")
+        print(modal_factors)
+
+        print("Mode shapes:")
+        print(mode_shapes.shape)
+
+        fig, axes = plt.subplots(
+            1,
+            4,
+            figsize=(12, 3),
+        )
+
+        for k in range(4):
+            axes[k].imshow(
+                mode_shapes[k],
+                origin="lower",
+            )
+
+            axes[k].set_title(
+                f"Mode {k + 1}\n"
+                f"mu={modal_factors[k]:.2f}"
+            )
+
+            axes[k].axis("off")
+
+        fig.suptitle(name)
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    from shapes import make_morph_mask
+
+    N_MODES = 32
+    RESOLUTION = 128
+    ASPECT = 1.0
+
+    morph_values = np.linspace(
+        0.0,
+        1.0,
+        9,
+    )
+
+    all_factors = []
+
+    for morph in morph_values:
+        mask = make_morph_mask(
+            morph=morph,
+            aspect=ASPECT,
+            resolution=RESOLUTION,
+        )
+
+        modal_factors, mode_shapes = solve_shape_modes(
+            mask,
+            n_modes=N_MODES,
+        )
+
+        all_factors.append(modal_factors)
+
+        print(
+            f"morph={morph:.3f}"
+        )
+        print(modal_factors)
+        print()
+
+    import matplotlib.pyplot as plt
+
+    all_factors = np.asarray(
+        all_factors
+    )
+
+    for k in range(N_MODES):
+        plt.plot(
+            morph_values,
+            all_factors[:, k],
+        )
+
+    plt.xlabel("Morph")
+    plt.ylabel("Modal factor")
+    plt.title("Modal factors over shape morph")
+    plt.show()

@@ -12,7 +12,7 @@ from reference import (
 )
 
 
-N_MODES = 16
+N_MODES = 32
 N_SAMPLES = 5000
 
 ASPECT_MIN = 0.5

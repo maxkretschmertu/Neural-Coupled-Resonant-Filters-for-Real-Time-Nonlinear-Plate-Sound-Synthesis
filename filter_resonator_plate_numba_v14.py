@@ -8,7 +8,7 @@ from numba import njit
 
 
 fs = 48000.0                                             #sample rate
-n_Modes = 16                                             # number of modes
+n_Modes = 32                                            # number of modes
 #f0 = 200
 alpha_r = 4e-5                                          #damping coeffincient inducing linear plate vibration charactersitics
 alpha_g = 0.3322                                        #damping coeffincient inducing linear plate vibration charactersitics
