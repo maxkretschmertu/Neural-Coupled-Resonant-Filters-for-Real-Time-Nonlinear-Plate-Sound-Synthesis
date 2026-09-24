@@ -1,8 +1,8 @@
-# NN Plan — V12 + Compact Neural Resonator
+# NN Plan — V14 + Compact Neural Resonator
 
 ## Goal
 
-Build the neural extension on top of `filter_resonator_plate_numba_v12.py` while keeping the codebase small and understandable.
+Build the neural extension on top of `filter_resonator_plate_numba_v14.py` while keeping the codebase small and understandable.
 
 The target is the full functionality discussed so far:
 
@@ -13,8 +13,8 @@ The target is the full functionality discussed so far:
 - geometry- and position-dependent strike response
 - independent pickup position
 - physical size and material scaling
-- the existing V12 damping controls
-- the existing V12 nonlinear mode coupling
+- the existing V14 damping controls
+- the existing V14 nonlinear mode coupling
 - real-time operation
 - no FEM/numerical solver in the audio callback
 - no neural network that generates audio directly
@@ -57,20 +57,20 @@ mu[N] + Size + D + rho + H
 physical modal frequencies
         |
         v
-V12 resonator bank
+V14 resonator bank
         |
         + strike gains
         + pickup gains
         |
         v
-V12 nonlinear coupling
+V14 nonlinear coupling
 (tau, eta, lambda)
         |
         v
 Audio
 ```
 
-The neural network replaces only the rectangle-specific modal description. V12 remains the real-time synthesizer.
+The neural network replaces only the rectangle-specific modal description. V14 remains the real-time synthesizer.
 
 ---
 
@@ -78,7 +78,7 @@ The neural network replaces only the rectangle-specific modal description. V12 r
 
 ### 2.1 Geometry-dependent modal structure
 
-Current V12:
+Current V14:
 
 ```text
 Lx, Ly -> analytic rectangle mode formula -> frequencies
@@ -94,7 +94,7 @@ The network learns how geometry changes the resonance pattern.
 
 ### 2.2 Spatial modal response
 
-Current V12 excitation weighting:
+Current V14 excitation weighting:
 
 ```python
 sin(l * pi * x) * sin(m * pi * y)
@@ -140,17 +140,18 @@ This preserves independent strike and pickup positions without predicting full 6
 | Flexural rigidity D | yes | analytical scaling |
 | Density rho | yes | analytical scaling |
 | Thickness H | yes | analytical scaling |
-| Frequency scale | yes | V12/runtime |
-| alpha_g / alpha_r damping | yes | V12 |
-| Excitation length | yes | V12 |
-| Strike trigger | yes | V12 |
-| tau | yes | V12 |
-| eta | yes | V12 |
-| lambda | yes | V12 |
-| Existing nonlinear mode coupling | yes | V12 |
+| Frequency scale | yes | V14/runtime |
+| alpha_g / alpha_r damping | yes | V14 |
+| Excitation length | yes | V14 |
+| Excitation amplitude A | yes | V14 |
+| Strike trigger | yes | V14 |
+| tau | yes | V14 |
+| eta | yes | V14 |
+| lambda | yes | V14 |
+| Existing nonlinear mode coupling | yes | V14 |
 | Real-time morphing | yes | control-rate NN inference |
 | Numerical solver during audio | no | offline only |
-| NN directly generates audio | no | V12 generates audio |
+| NN directly generates audio | no | V14 generates audio |
 | Full spatial mode-shape images as NN output | no | intentionally omitted |
 
 The main functionality intentionally omitted from the earlier large design is full mode-shape-image prediction. The synthesizer only needs modal frequencies and modal sensitivity at the strike and pickup positions.
@@ -369,15 +370,15 @@ No large mode-shape image loss is required.
 
 ---
 
-## 10. V12 integration
+## 10. V14 integration
 
 Base file:
 
 ```text
-filter_resonator_plate_numba_v12.py
+filter_resonator_plate_numba_v14.py
 ```
 
-The existing V12 DSP is retained as much as possible.
+The existing V14 DSP is retained as much as possible.
 
 ### Keep
 
@@ -392,6 +393,7 @@ The existing V12 DSP is retained as much as possible.
 - nonlinear state transfer
 - state limiting
 - excitation envelope
+- excitation amplitude `A`
 
 ### Replace or adapt
 
@@ -432,7 +434,7 @@ u_ex[k, :] = strike_gains[k] * u
 
 #### Output pickup
 
-Current V12:
+Current V14:
 
 ```python
 sum(states[k].imag)
@@ -483,7 +485,7 @@ Morph 0.40 -> 0.41 -> 0.42 -> 0.43
 Keep the implementation small:
 
 ```text
-filter_resonator_plate_numba_v12.py
+filter_resonator_plate_numba_v14.py
 
 neural/
     shapes.py
@@ -502,7 +504,7 @@ shapes.py       ~100 lines
 reference.py    ~150 lines
 model.py         ~80 lines
 train.py        ~150-200 lines
-V12 changes     ~100 lines
+V14 changes     ~100 lines
 ```
 
 Target total: roughly 500-600 new relevant lines, not thousands.
@@ -513,14 +515,14 @@ No Hydra, Lightning, WandB, HDF5 shard framework, Gmsh, Morley FEM framework, or
 
 ## 13. Development phases
 
-### Phase 1 — Freeze V12
+### Phase 1 — Freeze V14
 
-Create a neural working copy based on V12.
+Create a neural working copy based on V14.
 
 Requirement:
 
 ```text
-Before NN work, it must behave and sound like V12.
+Before NN work, it must behave and sound like V14.
 ```
 
 ### Phase 2 — Common modal interface
@@ -539,7 +541,7 @@ strike_gains
 pickup_gains
 ```
 
-Initially the result must reproduce the original V12 behavior.
+Initially the result must reproduce the original V14 behavior.
 
 ### Phase 3 — NN hello world: rectangle frequencies only
 
@@ -625,7 +627,7 @@ Save:
 models/plate_nn.pt
 ```
 
-### Phase 8 — Real-time V12 integration
+### Phase 8 — Real-time V14 integration
 
 Replace the analytical modal source with:
 
@@ -641,14 +643,14 @@ Add controls:
 - Strike X/Y
 - Pickup X/Y
 
-Keep V12 material, damping and nonlinear controls.
+Keep V14 material, damping and nonlinear controls.
 
 ### Phase 9 — A/B validation
 
 For rectangles compare:
 
 ```text
-V12 analytical model
+V14 analytical model
 reference solver
 NN prediction
 ```
@@ -669,7 +671,7 @@ Then test ellipse, triangle and morph intermediates.
 
 The project is complete when:
 
-1. V12 nonlinear resonator synthesis is still operational.
+1. V14 nonlinear resonator synthesis is still operational.
 2. Rectangle behavior can be reproduced closely by the NN.
 3. Morph can move continuously between rectangle, ellipse and triangle.
 4. Intermediate shapes produce continuous modal changes.
@@ -691,7 +693,7 @@ To keep the project compact, the first complete version will not include:
 - general-purpose FEM infrastructure
 - structural mesh import
 - arbitrary boundary-condition families
-- differentiable nonlinear V12 feedback during training
+- differentiable nonlinear V14 feedback during training
 - end-to-end audio generation by a neural network
 - large experiment-management frameworks
 
@@ -714,7 +716,7 @@ Known physics remains explicit:
 modal factors + material + size -> physical frequencies
 ```
 
-The existing V12 engine remains responsible for:
+The existing V14 engine remains responsible for:
 
 ```text
 resonators
