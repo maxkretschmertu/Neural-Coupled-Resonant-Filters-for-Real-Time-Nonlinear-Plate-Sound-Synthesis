@@ -1,12 +1,12 @@
+from pathlib import Path
+
 import numpy as np
 import sounddevice as sd
 import torch
-from pathlib import Path
-from tkinter import *
-from tkinter import ttk
-
 from numba import njit
 from skimage.measure import points_in_poly
+from tkinter import *
+from tkinter import ttk
 
 from neural.model import PlateNet
 from neural.shapes import make_morph_contour
@@ -14,795 +14,247 @@ from neural.shapes import make_morph_contour
 
 fs = 48000.0
 n_Modes = 32
-root = Tk()
+MAX_STATE_MAG = 10.0
 
+params = {
+    "alpha_g": 0.3322, "alpha_r": 4e-5,
+    "tau": 1.0, "eta": 0.01, "lamb": 0.01,
+    "size": 1.0, "aspect": 1.0, "morph": 0.0,
+    "D": 18300.0, "rho": 7800.0, "H": 0.01,
+    "excitation": 0,
+    "x_e": -0.3, "y_e": 0.3,
+    "x_p": 0.3, "y_p": 0.3,
+    "N_ex": 192, "A": 0.5,
+    "impact_start": None, "changed": False,
+}
 
 plate_net = PlateNet(n_modes=n_Modes)
 plate_net.load_state_dict(torch.load(
     Path(__file__).parent / "models" / "plate_nn.pt",
-    map_location="cpu",
-    weights_only=True,
+    map_location="cpu", weights_only=True,
 ))
 plate_net.eval()
 
 
-canvas_size = 300
-ttk.Label(root, text="Strike: left drag | Pickup: right drag").pack()
-canvas_id = Canvas(root, width=canvas_size, height=canvas_size, bg="white")
-canvas_id.pack(pady=6)
-shape_id = canvas_id.create_polygon(0, 0, fill="", outline="black", width=2)
-
-
-params = {
-    "alpha_g": 0.3322,
-    "alpha_r": 4e-5,
-
-    "tau": 1,
-    "eta": 0.01,
-    "lamb": 0.01,
-
-    "size": 1.0,
-    "aspect": 1.0,
-    "morph": 0.0,
-
-    "D": 18300,
-    "rho": 7800.0,
-    "H": 0.01,
-
-    "excitation": 0,
-
-    "x_e": -0.3,
-    "y_e": 0.3,
-
-    "x_p": 0.3,
-    "y_p": 0.3,
-
-    "N_ex": 192,
-    "changed": False,
-    "A": 0.5,
-}
-
-
-def modal_factors_to_freqs(modal_factors, size, D, rho, H):
-    omega = modal_factors * np.sqrt(D / (rho * H)) / size**2
-    return omega / (2 * np.pi)
-
-
 @torch.no_grad()
-def neural_plate_model(
-    size, aspect, morph,
-    D, rho, H,
-    x_e, y_e,
-    x_p, y_p,
-):
-    geometry = torch.tensor(
-        [[morph, aspect]],
-        dtype=torch.float32,
-    )
+def plate_model():
+    geometry = torch.tensor([[params["morph"], params["aspect"]]], dtype=torch.float32)
+    points = torch.tensor([[
+        [params["x_e"], params["y_e"]],
+        [params["x_p"], params["y_p"]],
+    ]], dtype=torch.float32)
 
-    points = torch.tensor(
-        [[
-            [x_e, y_e],
-            [x_p, y_p],
-        ]],
-        dtype=torch.float32,
-    )
-
-    modal_factors, gains = plate_net(
-        geometry,
-        points,
-    )
-
-    modal_factors = modal_factors[0].numpy().astype(np.float64)
+    mu, gains = plate_net(geometry, points)
+    mu = mu[0].numpy().astype(np.float64)
     gains = gains[0].numpy().astype(np.float64)
+    freqs = mu * np.sqrt(params["D"] / (params["rho"] * params["H"])) / (2 * np.pi * params["size"] ** 2)
+    return freqs, gains[0], gains[1]
 
-    freqs = modal_factors_to_freqs(
-        modal_factors,
-        size,
-        D,
-        rho,
-        H,
+
+def distribution_matrix(freqs):
+    diff = np.abs(freqs[:, None] - freqs[None, :])
+    a = 1.0 - diff / np.mean(freqs)
+    np.fill_diagonal(a, 0.0)
+    denom = a.sum(axis=1, keepdims=True)
+    denom[denom == 0] = 1.0
+    return np.ascontiguousarray(
+        params["eta"] * params["lamb"] * a / denom - params["lamb"] * np.eye(len(freqs)),
+        dtype=np.float64,
     )
 
-    return modal_factors, freqs, gains[0], gains[1]
+
+def build_runtime():
+    freqs, strike, pickup = plate_model()
+    alphas = np.exp(np.minimum(params["alpha_g"] + params["alpha_r"] * freqs, 700.0))
+    Z = np.exp(-alphas / fs) * np.exp(1j * 2 * np.pi * freqs / fs)
+    return (
+        freqs,
+        np.ascontiguousarray(Z, dtype=np.complex128),
+        distribution_matrix(freqs),
+        np.ascontiguousarray(strike, dtype=np.float64),
+        np.ascontiguousarray(pickup, dtype=np.float64),
+    )
 
 
-def distribution_matrix(freqs_arr, eta=0.01, lamb=1.0):
-    freqs_arr = np.asarray(freqs_arr, dtype=np.float64)
-    n = len(freqs_arr)
-
-    if n <= 1:
-        return np.zeros((n, n), dtype=np.float64)
-
-    diff = np.abs(freqs_arr[:, None] - freqs_arr[None, :])
-    a = 1.0 - diff / np.mean(freqs_arr)
-    np.fill_diagonal(a, 0.0)
-
-    denom = np.sum(a, axis=1, keepdims=True)
-    denom[denom == 0] = 1.0
-
-    M = eta * lamb * a / denom - lamb * np.eye(n)
-    return np.ascontiguousarray(M, dtype=np.float64)
-
-
-def excitation_signal(pos, mode_gains, N_ex=2, A=0.5):
-    pos = np.asarray(pos, dtype=np.float64)
-    n = len(mode_gains)
-    frames = pos.shape[0]
-
-    if params.get("excitation") == 0:
-        u = np.zeros_like(pos)
-        within = pos < N_ex
-        scale = 2.0 / N_ex if N_ex > 0 else 1.0
-        u[within] = A * scale * np.sin(np.pi * pos[within] / N_ex) ** 2
+def excitation_signal(pos, gains):
+    if params["excitation"] == 0:
+        u = np.zeros_like(pos, dtype=np.float64)
+        inside = pos < params["N_ex"]
+        u[inside] = (
+            params["A"] * 2.0 / params["N_ex"]
+            * np.sin(np.pi * pos[inside] / params["N_ex"]) ** 2
+        )
     else:
         u = (pos % int(fs) == 0).astype(np.float64)
-
-    u_ex = np.empty((n, frames), dtype=np.float64)
-
-    for k in range(n):
-        u_ex[k, :] = mode_gains[k] * u
-
-    return np.ascontiguousarray(u_ex, dtype=np.float64)
+    return np.ascontiguousarray(gains[:, None] * u[None, :])
 
 
 @njit(cache=True, fastmath=True)
-def process_block(
-    states,
-    Z,
-    M,
-    u,
-    pickup_gains,
-    tau,
-    max_state_mag,
-    s_out,
-    T_last,
-):
-    n = states.shape[0]
-    frames = u.shape[1]
+def process_block(states, Z, M, u, pickup, tau, max_state_mag, out):
+    n = len(states)
+    rectified = np.empty(n)
+    T = np.empty(n)
 
-    rectified = np.empty(n, dtype=np.float64)
-    T = np.empty(n, dtype=np.float64)
-
-    for i in range(frames):
-
+    for i in range(u.shape[1]):
         for k in range(n):
-            zr = states[k].real
-            zi = states[k].imag
-            p = 0.5 * (zr * zr + zi * zi)
-            r = p - tau
+            zr, zi = states[k].real, states[k].imag
+            r = 0.5 * (zr * zr + zi * zi) - tau
             rectified[k] = r if r > 0.0 else 0.0
 
         for k in range(n):
             acc = 0.0
-
             for j in range(n):
                 acc += M[k, j] * rectified[j]
-
             T[k] = acc if acc > 0.0 else 0.0
 
         for k in range(n):
-            zr = states[k].real
-            zi = states[k].imag
+            zr, zi = states[k].real, states[k].imag
             mag2 = zr * zr + zi * zi
 
             if mag2 < 1e-20:
-                amp = np.sqrt(2.0 * T[k])
-                new_z = amp * Z[k] + u[k, i]
+                new_z = np.sqrt(2.0 * T[k]) * Z[k] + u[k, i]
             else:
-                factor = np.sqrt(1.0 + (2.0 * T[k]) / mag2)
-                new_z = factor * Z[k] * states[k] + u[k, i]
+                new_z = np.sqrt(1.0 + 2.0 * T[k] / mag2) * Z[k] * states[k] + u[k, i]
 
-            nr = new_z.real
-            ni = new_z.imag
-            mag = np.sqrt(nr * nr + ni * ni)
-
+            mag = np.sqrt(new_z.real ** 2 + new_z.imag ** 2)
             if mag > max_state_mag:
-                comp = max_state_mag * np.tanh(mag / max_state_mag)
-                new_z = new_z * (comp / mag)
-
+                new_z *= max_state_mag * np.tanh(mag / max_state_mag) / mag
             states[k] = new_z
 
         acc = 0.0
-
         for k in range(n):
-            acc += pickup_gains[k] * states[k].imag
-
-        s_out[i] = acc
-
-        if i == frames - 1:
-            for k in range(n):
-                T_last[k] = T[k]
+            acc += pickup[k] * states[k].imag
+        out[i] = acc
 
 
-def _strike():
-    params["impact_start"] = callback.pos
-    print(f"Strike scheduled at sample {callback.pos}")
+states = np.zeros(n_Modes, dtype=np.complex128)
+runtime = build_runtime()
+
+_, Z0, M0, _, pickup0 = runtime
+process_block(
+    states.copy(), Z0, M0, np.zeros((n_Modes, 4)), pickup0,
+    params["tau"], MAX_STATE_MAG, np.zeros(4),
+)
+print("Numba-Kernel kompiliert.")
 
 
-def current_contour():
-    return make_morph_contour(
-        params["morph"],
-        params["aspect"],
+def callback(outdata, frames, time, status):
+    global runtime
+    if status:
+        print(status)
+
+    if params["changed"]:
+        runtime = build_runtime()
+        params["changed"] = False
+
+    _, Z, M, strike, pickup = runtime
+    pos = callback.pos + np.arange(frames)
+    u = (
+        np.zeros((n_Modes, frames), dtype=np.float64)
+        if params["impact_start"] is None
+        else excitation_signal(pos - params["impact_start"], strike)
     )
+
+    out = np.empty(frames)
+    process_block(states, Z, M, u, pickup, params["tau"], MAX_STATE_MAG, out)
+    callback.pos += frames
+
+    out = np.nan_to_num(out / np.sqrt(n_Modes), nan=0.0, posinf=0.0, neginf=0.0)
+    outdata[:] = np.clip(out, -1.0, 1.0).reshape(-1, 1)
+
+
+callback.pos = 0
+
+
+root = Tk()
+root.title("Resonator Filter GUI (Numba)")
+canvas_size = 300
+ttk.Label(root, text="Strike: left drag | Pickup: right drag").pack()
+canvas = Canvas(root, width=canvas_size, height=canvas_size, bg="white")
+canvas.pack(pady=6)
+shape_id = canvas.create_polygon(0, 0, fill="", outline="black", width=2)
+
+
+def contour():
+    return make_morph_contour(params["morph"], params["aspect"])
 
 
 def point_inside(x, y):
-    return points_in_poly(
-        np.array([[x, y]]),
-        current_contour(),
-    )[0]
+    return points_in_poly(np.array([[x, y]]), contour())[0]
 
 
-def _draw_points():
-    canvas_id.delete("strike")
-    canvas_id.delete("pickup")
+def draw():
+    c = contour()
+    xy = np.column_stack((
+        (c[:, 0] + 1) * 0.5 * canvas_size,
+        (1 - c[:, 1]) * 0.5 * canvas_size,
+    ))
+    canvas.coords(shape_id, *xy.ravel())
 
     for tag, x, y, color in (
         ("strike", params["x_e"], params["y_e"], "red"),
         ("pickup", params["x_p"], params["y_p"], "green"),
     ):
-        px = int((x + 1.0) * 0.5 * (canvas_size - 1))
-        py = int((1.0 - y) * 0.5 * (canvas_size - 1))
-        r = 6
-
-        canvas_id.create_oval(
-            px-r,
-            py-r,
-            px+r,
-            py+r,
-            fill=color,
-            tags=(tag,),
-        )
+        canvas.delete(tag)
+        px = (x + 1) * 0.5 * (canvas_size - 1)
+        py = (1 - y) * 0.5 * (canvas_size - 1)
+        canvas.create_oval(px - 6, py - 6, px + 6, py + 6, fill=color, tags=tag)
 
 
-def update_canvas():
-    contour = current_contour()
-
-    xy = np.column_stack((
-        (contour[:, 0] + 1.0) * 0.5 * canvas_size,
-        (1.0 - contour[:, 1]) * 0.5 * canvas_size,
-    ))
-
-    canvas_id.coords(
-        shape_id,
-        *xy.ravel(),
-    )
-
-    _draw_points()
-
-
-modal_factors, filter_freqs, strike_gains, pickup_gains = neural_plate_model(
-    params["size"],
-    params["aspect"],
-    params["morph"],
-    params["D"],
-    params["rho"],
-    params["H"],
-    params["x_e"],
-    params["y_e"],
-    params["x_p"],
-    params["y_p"],
-)
-
-
-_freqs_np_init = np.asarray(
-    filter_freqs,
-    dtype=np.float64,
-)
-
-_alphas_init = np.exp(np.minimum(
-    params["alpha_g"]
-    + params["alpha_r"] * _freqs_np_init,
-    700.0,
-))
-
-Z = (
-    np.exp(-_alphas_init / fs)
-    * np.exp(
-        1j
-        * 2
-        * np.pi
-        * _freqs_np_init
-        / fs
-    )
-)
-
-Z = np.ascontiguousarray(
-    Z,
-    dtype=np.complex128,
-)
-
-states = np.zeros(
-    len(filter_freqs),
-    dtype=np.complex128,
-)
-
-last_params = params.copy()
-
-M = distribution_matrix(
-    filter_freqs,
-    params["eta"],
-    params["lamb"],
-)
-
-last_T = np.zeros(
-    len(filter_freqs),
-    dtype=np.float64,
-)
-
-MAX_STATE_MAG = 10.0
-
-
-_dummy_states = states.copy()
-_dummy_u = np.zeros(
-    (len(filter_freqs), 4),
-    dtype=np.float64,
-)
-_dummy_out = np.zeros(
-    4,
-    dtype=np.float64,
-)
-_dummy_T = np.zeros(
-    len(filter_freqs),
-    dtype=np.float64,
-)
-
-process_block(
-    _dummy_states,
-    Z,
-    M,
-    _dummy_u,
-    pickup_gains,
-    float(params["tau"]),
-    MAX_STATE_MAG,
-    _dummy_out,
-    _dummy_T,
-)
-
-print("Numba-Kernel kompiliert.")
-
-
-def callback(outdata, frames, time, status):
-    if status:
-        print(status)
-
-    global modal_factors, filter_freqs, strike_gains, pickup_gains
-    global Z, states, last_params, M, last_T
-
-    if params["changed"]:
-        last_params = params.copy()
-
-        modal_factors, filter_freqs, strike_gains, pickup_gains = neural_plate_model(
-            params["size"],
-            params["aspect"],
-            params["morph"],
-            params["D"],
-            params["rho"],
-            params["H"],
-            params["x_e"],
-            params["y_e"],
-            params["x_p"],
-            params["y_p"],
-        )
-
-        freqs_np = np.asarray(
-            filter_freqs,
-            dtype=np.float64,
-        )
-
-        alphas = np.exp(np.minimum(
-            params["alpha_g"]
-            + params["alpha_r"] * freqs_np,
-            700.0,
-        ))
-
-        Z = (
-            np.exp(-alphas / fs)
-            * np.exp(
-                1j
-                * 2
-                * np.pi
-                * freqs_np
-                / fs
-            )
-        )
-
-        Z = np.ascontiguousarray(
-            Z,
-            dtype=np.complex128,
-        )
-
-        M = distribution_matrix(
-            filter_freqs,
-            params["eta"],
-            params["lamb"],
-        )
-
-        last_T = np.zeros(
-            len(filter_freqs),
-            dtype=np.float64,
-        )
-
-        params["changed"] = False
-
-    n = len(states)
-
-    pos = callback.pos + np.arange(frames)
-
-    if params.get("impact_start") is None:
-        u = np.zeros(
-            (n, frames),
-            dtype=np.float64,
-        )
-    else:
-        u = excitation_signal(
-            pos - params["impact_start"],
-            strike_gains,
-            params["N_ex"],
-            params["A"],
-        )
-
-    u = np.ascontiguousarray(
-        u,
-        dtype=np.float64,
-    )
-
-    s_out = np.empty(
-        frames,
-        dtype=np.float64,
-    )
-
-    process_block(
-        states,
-        Z,
-        M,
-        u,
-        pickup_gains,
-        float(params["tau"]),
-        MAX_STATE_MAG,
-        s_out,
-        last_T,
-    )
-
-    callback.pos += frames
-
-    out = s_out / max(np.sqrt(n), 1)
-    out = np.nan_to_num(
-        out,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    out = np.clip(
-        out,
-        -1.0,
-        1.0,
-    )
-
-    outdata[:] = out.reshape(-1, 1)
-
-
-callback.pos = 0
-params["impact_start"] = None
-
-
-stream = sd.OutputStream(
-    channels=1,
-    samplerate=int(fs),
-    callback=callback,
-)
-
-sd.sleep(1)
-stream.start()
-
-
-for f in filter_freqs:
-    print(f"Filter frequency: {f:.2f} Hz")
-
-
-def set_model_param(name, value):
+def set_param(name, value):
     params[name] = float(value)
-
     if name in ("morph", "aspect"):
-        for x_name, y_name in (
-            ("x_e", "y_e"),
-            ("x_p", "y_p"),
-        ):
-            if not point_inside(
-                params[x_name],
-                params[y_name],
-            ):
-                params[x_name] = 0.0
-                params[y_name] = 0.0
-
-        update_canvas()
-
+        for x, y in (("x_e", "y_e"), ("x_p", "y_p")):
+            if not point_inside(params[x], params[y]):
+                params[x] = params[y] = 0.0
+        draw()
     params["changed"] = True
 
 
-root.title("Resonator Filter GUI (Numba)")
-frm = ttk.Frame(root, padding=10)
-
-
-gain_slider = ttk.Scale(
-    root,
-    from_=0.0,
-    to=2,
-    orient="horizontal",
-    command=lambda v:
-        params.__setitem__(
-            "A",
-            float(v),
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Excitation Amplitude",
-).pack()
-
-gain_slider.pack(
-    fill="x"
-)
-
-gain_slider.set(
-    params["A"]
-)
-
-
-strike_btn = ttk.Button(
-    root,
-    text="Strike",
-    command=_strike,
-)
-
-strike_btn.pack(
-    pady=6
-)
-
-
-excitation_btn = ttk.Button(
-    root,
-    text="Toggle Excitation",
-    command=lambda:
-        params.__setitem__(
-            "excitation",
-            1 - params["excitation"],
-        ),
-)
-
-excitation_btn.pack(
-    pady=6
-)
-
-
-morph_slider = ttk.Scale(
-    root,
-    from_=0.0,
-    to=1.0,
-    orient="horizontal",
-    command=lambda v:
-        set_model_param(
-            "morph",
-            v,
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Morph",
-).pack()
-
-morph_slider.pack(
-    fill="x"
-)
-
-morph_slider.set(
-    params["morph"]
-)
-
-
-size_slider = ttk.Scale(
-    root,
-    from_=0.01,
-    to=5.0,
-    orient="horizontal",
-    command=lambda v:
-        set_model_param(
-            "size",
-            v,
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Size [m]",
-).pack()
-
-size_slider.pack(
-    fill="x"
-)
-
-size_slider.set(
-    params["size"]
-)
-
-
-aspect_slider = ttk.Scale(
-    root,
-    from_=0.5,
-    to=2.0,
-    orient="horizontal",
-    command=lambda v:
-        set_model_param(
-            "aspect",
-            v,
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Aspect",
-).pack()
-
-aspect_slider.pack(
-    fill="x"
-)
-
-aspect_slider.set(
-    params["aspect"]
-)
-
-
-spacing_slider = ttk.Scale(
-    root,
-    from_=0.001,
-    to=5,
-    orient="horizontal",
-    command=lambda v:
-        set_model_param(
-            "alpha_g",
-            v,
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Alpha_g",
-).pack()
-
-spacing_slider.pack(
-    fill="x"
-)
-
-spacing_slider.set(
-    params["alpha_g"]
-)
-
-
-excitation_slider = Scale(
-    root,
-    from_=2,
-    to=192,
-    orient="horizontal",
-    resolution=1,
-    command=lambda v:
-        params.__setitem__(
-            "N_ex",
-            int(float(v)),
-        ),
-)
-
-ttk.Label(
-    root,
-    text="Excitation Length",
-).pack()
-
-excitation_slider.pack(
-    fill="x"
-)
-
-excitation_slider.set(
-    params["N_ex"]
-)
-
-
-ttk.Label(
-    frm,
-    text="Filter GUI",
-).grid(
-    column=0,
-    row=0,
-)
-
-
-def _set_point(event, x_name, y_name):
-    x = (
-        2.0
-        * min(
-            max(event.x, 0),
-            canvas_size - 1,
-        )
-        / (canvas_size - 1)
-        - 1.0
-    )
-
-    y = (
-        1.0
-        - 2.0
-        * min(
-            max(event.y, 0),
-            canvas_size - 1,
-        )
-        / (canvas_size - 1)
-    )
-
+def set_point(event, x_name, y_name):
+    x = 2 * np.clip(event.x, 0, canvas_size - 1) / (canvas_size - 1) - 1
+    y = 1 - 2 * np.clip(event.y, 0, canvas_size - 1) / (canvas_size - 1)
     if point_inside(x, y):
-        params[x_name] = x
-        params[y_name] = y
+        params[x_name], params[y_name] = x, y
         params["changed"] = True
-        _draw_points()
+        draw()
 
 
-_drag = {
-    "on": False
-}
+def add_slider(label, name, lo, hi, model_param=True):
+    ttk.Label(root, text=label).pack()
+    command = (lambda v: set_param(name, v)) if model_param else (lambda v: params.__setitem__(name, float(v)))
+    s = ttk.Scale(root, from_=lo, to=hi, orient="horizontal", command=command)
+    s.set(params[name])
+    s.pack(fill="x")
 
 
-def _on_press(event):
-    _drag["on"] = True
-    _on_move(event)
+ttk.Button(root, text="Strike", command=lambda: params.__setitem__("impact_start", callback.pos)).pack(pady=6)
+ttk.Button(
+    root, text="Toggle Excitation",
+    command=lambda: params.__setitem__("excitation", 1 - params["excitation"]),
+).pack(pady=6)
 
+add_slider("Excitation Amplitude", "A", 0.0, 2.0, False)
+add_slider("Morph", "morph", 0.0, 1.0)
+add_slider("Size [m]", "size", 0.01, 5.0)
+add_slider("Aspect", "aspect", 0.5, 2.0)
+add_slider("Alpha_g", "alpha_g", 0.001, 5.0)
 
-def _on_move(event):
-    if _drag["on"]:
-        _set_point(
-            event,
-            "x_e",
-            "y_e",
-        )
-
-
-def _on_release(event):
-    _drag["on"] = False
-
-
-canvas_id.bind(
-    "<Button-1>",
-    _on_press,
+ttk.Label(root, text="Excitation Length").pack()
+s = Scale(
+    root, from_=2, to=192, orient=HORIZONTAL, resolution=1,
+    command=lambda v: params.__setitem__("N_ex", int(float(v))),
 )
+s.set(params["N_ex"])
+s.pack(fill="x")
 
-canvas_id.bind(
-    "<B1-Motion>",
-    _on_move,
-)
+canvas.bind("<Button-1>", lambda e: set_point(e, "x_e", "y_e"))
+canvas.bind("<B1-Motion>", lambda e: set_point(e, "x_e", "y_e"))
+canvas.bind("<Button-3>", lambda e: set_point(e, "x_p", "y_p"))
+canvas.bind("<B3-Motion>", lambda e: set_point(e, "x_p", "y_p"))
 
-canvas_id.bind(
-    "<ButtonRelease-1>",
-    _on_release,
-)
+draw()
+print("Initial frequencies:", np.round(runtime[0], 2))
 
-canvas_id.bind(
-    "<Button-3>",
-    lambda e:
-        _set_point(
-            e,
-            "x_p",
-            "y_p",
-        ),
-)
-
-canvas_id.bind(
-    "<B3-Motion>",
-    lambda e:
-        _set_point(
-            e,
-            "x_p",
-            "y_p",
-        ),
-)
-
-
-update_canvas()
-root.mainloop()
+with sd.OutputStream(channels=1, samplerate=int(fs), callback=callback):
+    root.mainloop()
