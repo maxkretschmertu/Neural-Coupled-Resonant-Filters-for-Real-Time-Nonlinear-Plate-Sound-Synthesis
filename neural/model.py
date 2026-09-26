@@ -1,58 +1,52 @@
 import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 
 class PlateNet(nn.Module):
-    def __init__(self, n_modes=32, latent_dim=256):
+    def __init__(
+        self,
+        n_modes=32,
+        latent_dim=128,
+        fourier_bands=8,
+    ):
         super().__init__()
 
         self.n_modes = n_modes
+        self.fourier_bands = fourier_bands
 
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 5, 2, 2),
-            nn.GroupNorm(4, 16),
+        # morph + aspect -> geometry latent
+        self.geometry_net = nn.Sequential(
+            nn.Linear(2, 128),
             nn.SiLU(),
-            nn.Conv2d(16, 32, 3, 2, 1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, 3, 2, 1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, 3, 2, 1),
-            nn.GroupNorm(16, 128),
+            nn.Linear(128, latent_dim),
             nn.SiLU(),
         )
 
-        self.geometry_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 512),
-            nn.SiLU(),
-            nn.Linear(512, latent_dim),
-            nn.SiLU(),
-        )
-
+        # geometry latent -> modal factors
         self.frequency_head = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 128),
+            nn.Linear(latent_dim, 128),
             nn.SiLU(),
             nn.Linear(128, n_modes),
         )
 
+        # x, y plus Fourier features
+        point_dim = 2 + 4 * fourier_bands
+
         self.point_head = nn.Sequential(
-            nn.Linear(latent_dim + 2, 256),
+            nn.Linear(latent_dim + point_dim, 256),
             nn.SiLU(),
             nn.Linear(256, 256),
             nn.SiLU(),
             nn.Linear(256, n_modes),
         )
 
-        self._init_frequency_head()
+        self._init_frequencies()
 
 
-    def _init_frequency_head(self):
+    def _init_frequencies(self):
         output = self.frequency_head[-1]
 
         nn.init.normal_(
@@ -67,10 +61,23 @@ class PlateNet(nn.Module):
             output.bias[1:] = -2.1
 
 
-    def encode(self, shape):
-        return self.geometry_head(
-            self.encoder(shape)
+    def encode_geometry(self, geometry):
+        """
+        geometry[:, 0] = morph  [0, 1]
+        geometry[:, 1] = aspect [0.5, 2]
+        """
+
+        morph = 2.0 * geometry[:, 0] - 1.0
+        aspect = (
+            geometry[:, 1] - 1.25
+        ) / 0.75
+
+        x = torch.stack(
+            (morph, aspect),
+            dim=-1,
         )
+
+        return self.geometry_net(x)
 
 
     def predict_log_factors(self, z):
@@ -86,7 +93,8 @@ class PlateNet(nn.Module):
         return torch.cat(
             (
                 first,
-                first + torch.cumsum(
+                first
+                + torch.cumsum(
                     spacing,
                     dim=1,
                 ),
@@ -95,48 +103,69 @@ class PlateNet(nn.Module):
         )
 
 
+    def point_features(self, points):
+        features = [points]
+
+        x = points[..., 0:1]
+        y = points[..., 1:2]
+
+        for k in range(1, self.fourier_bands + 1):
+            frequency = k * math.pi
+
+            features.extend(
+                (
+                    torch.sin(frequency * x),
+                    torch.cos(frequency * x),
+                    torch.sin(frequency * y),
+                    torch.cos(frequency * y),
+                )
+            )
+
+        return torch.cat(
+            features,
+            dim=-1,
+        )
+
+
     def predict_gains(self, z, points):
-        single_point = points.ndim == 2
+        """
+        z:      (B, latent)
+        points: (B, P, 2)
 
-        if single_point:
-            points = points[:, None, :]
+        returns:
+            (B, P, modes)
+        """
 
-        batch_size, n_points, _ = points.shape
+        features = self.point_features(
+            points
+        )
 
         z = z[:, None, :].expand(
             -1,
-            n_points,
+            points.shape[1],
             -1,
         )
 
         x = torch.cat(
-            (z, points),
+            (z, features),
             dim=-1,
         )
 
-        gains = self.point_head(
-            x.reshape(
-                batch_size * n_points,
-                -1,
-            )
+        return self.point_head(x)
+
+
+    def forward(self, geometry, points):
+        z = self.encode_geometry(
+            geometry
         )
 
-        gains = gains.reshape(
-            batch_size,
-            n_points,
-            self.n_modes,
+        factors = torch.exp(
+            self.predict_log_factors(z)
         )
 
-        if single_point:
-            gains = gains[:, 0]
-
-        return gains
-
-
-    def forward(self, shape, points):
-        z = self.encode(shape)
-
-        return (
-            self.predict_log_factors(z),
-            self.predict_gains(z, points),
+        gains = self.predict_gains(
+            z,
+            points,
         )
+
+        return factors, gains

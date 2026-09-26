@@ -1,9 +1,7 @@
 from pathlib import Path
-import copy
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
 from model import PlateNet
 
@@ -13,368 +11,338 @@ from model import PlateNet
 # ---------------------------------------------------------
 
 N_MODES = 32
-BATCH_SIZE = 16
-EPOCHS = 300
-PATIENCE = 60
+STEPS = 20000
+BATCH = 16
+PAIRS = 32
+N_FREQS = 64
 
-POINT_LR = 5e-4
-ENCODER_LR = 2e-5
-FREQUENCY_WEIGHT = 1000.0
+LR = 5e-4
+FREQ_WEIGHT = 10.0
+DAMPING = 0.03
 
 ROOT = Path(__file__).parent
-DATASET_PATH = ROOT / "plate_dataset.npz"
+DATA = np.load(ROOT / "plate_dataset.npz")
 MODEL_PATH = ROOT.parent / "models" / "plate_nn.pt"
+MODEL_PATH.parent.mkdir(exist_ok=True)
+
+torch.manual_seed(0)
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-torch.manual_seed(0)
-np.random.seed(0)
-
 print("Device:", device)
 
 
 # ---------------------------------------------------------
-# Dataset
+# Data
 # ---------------------------------------------------------
 
-data = np.load(DATASET_PATH)
-
-
-def make_loader(indices, shuffle):
-    dataset = TensorDataset(
-        torch.tensor(
-            data["masks"][indices],
-            dtype=torch.float32,
-        ).unsqueeze(1),
-
-        torch.tensor(
-            data["factors"][indices],
-            dtype=torch.float32,
-        ),
-
-        torch.tensor(
-            data["points"][indices],
-            dtype=torch.float32,
-        ),
-
-        torch.tensor(
-            data["point_gains"][indices],
-            dtype=torch.float32,
-        ),
-    )
-
-    return DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle,
-    )
-
-
-train_loader = make_loader(
-    data["train_indices"],
-    True,
+geometry = torch.tensor(
+    np.column_stack((DATA["morphs"], DATA["aspects"])),
+    dtype=torch.float32,
+    device=device,
 )
 
-val_loader = make_loader(
-    data["val_indices"],
-    False,
+factors = torch.tensor(
+    DATA["factors"],
+    dtype=torch.float32,
+    device=device,
 )
 
-print(
-    "Train geometries:",
-    len(data["train_indices"]),
+points = torch.tensor(
+    DATA["points"],
+    dtype=torch.float32,
+    device=device,
 )
 
-print(
-    "Validation geometries:",
-    len(data["val_indices"]),
+gains = torch.tensor(
+    DATA["point_gains"],
+    dtype=torch.float32,
+    device=device,
 )
+
+train = torch.tensor(
+    DATA["train_indices"],
+    device=device,
+)
+
+val = torch.tensor(
+    DATA["val_indices"],
+    device=device,
+)
+
+print("Train geometries:", len(train))
+print("Validation geometries:", len(val))
 
 
 # ---------------------------------------------------------
 # Model
 # ---------------------------------------------------------
 
-model = PlateNet(
-    n_modes=N_MODES,
-).to(device)
-
-checkpoint = torch.load(
-    MODEL_PATH,
-    map_location=device,
-    weights_only=False,
-)
-
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-
-# Frequency head stays fixed.
-for parameter in model.parameters():
-    parameter.requires_grad = True
-
-for parameter in model.frequency_head.parameters():
-    parameter.requires_grad = False
-
+model = PlateNet(N_MODES).to(device)
 
 optimizer = torch.optim.AdamW(
-    [
-        {
-            "params": model.point_head.parameters(),
-            "lr": POINT_LR,
-        },
-        {
-            "params": (
-                list(model.encoder.parameters())
-                + list(model.geometry_head.parameters())
-            ),
-            "lr": ENCODER_LR,
-        },
-    ]
+    model.parameters(),
+    lr=LR,
+    weight_decay=1e-5,
 )
 
 
 # ---------------------------------------------------------
-# Losses
+# Modal transfer function
 # ---------------------------------------------------------
 
-mode_weights = torch.ones(
-    N_MODES,
+omega = torch.logspace(
+    np.log10(float(factors[train].min()) * 0.9),
+    np.log10(float(factors[train].max()) * 1.05),
+    N_FREQS,
     device=device,
 )
 
-mode_weights[:4] = 4.0
-mode_weights[4:8] = 2.0
-mode_weights /= mode_weights.mean()
 
-
-def frequency_loss(predicted, target):
-    return (
-        (predicted - target).square()
-        * mode_weights
-    ).mean()
-
-
-def residue_loss(predicted_gains, target_gains):
-    predicted = (
-        predicted_gains[:, :, None, :]
-        * predicted_gains[:, None, :, :]
-    )
-
-    target = (
-        target_gains[:, :, None, :]
-        * target_gains[:, None, :, :]
-    )
+def response(mu, residues):
+    mu = mu[:, None, :, None]
+    w = omega[None, None, None, :]
 
     return (
-        (predicted - target).square().sum()
-        / target.square().sum().clamp_min(1e-8)
+        residues[..., None]
+        / (
+            mu**2
+            - w**2
+            + 1j * 2.0 * DAMPING * mu * w
+        )
+    ).sum(dim=2)
+
+
+def transfer_loss(predicted, target):
+    return (
+        (predicted - target).abs().square().sum()
+        / target.abs().square().sum().clamp_min(1e-8)
     )
+
+
+# ---------------------------------------------------------
+# Fixed validation pairs
+# ---------------------------------------------------------
+
+torch.manual_seed(1234)
+
+val_i = torch.randint(
+    points.shape[1],
+    (len(val), PAIRS),
+    device=device,
+)
+
+val_j = torch.randint(
+    points.shape[1],
+    (len(val), PAIRS),
+    device=device,
+)
+
+torch.manual_seed(0)
+
 
 # ---------------------------------------------------------
 # Validation
 # ---------------------------------------------------------
 
 @torch.no_grad()
-def evaluate():
-    model.eval()
+def validate():
+    z = model.encode_geometry(
+        geometry[val]
+    )
 
-    residue_error = 0.0
-    residue_energy = 0.0
+    mu_pred = torch.exp(
+        model.predict_log_factors(z)
+    )
 
-    factor_error = []
+    batch = torch.arange(
+        len(val),
+        device=device,
+    )[:, None]
 
-    for masks, factors, points, gains in val_loader:
-        masks = masks.to(device)
-        factors = factors.to(device)
-        points = points.to(device)
-        gains = gains.to(device)
+    p = points[val]
+    phi = gains[val]
 
-        z = model.encode(masks)
+    strike = p[batch, val_i]
+    pickup = p[batch, val_j]
 
-        predicted_log_factors = (
-            model.predict_log_factors(z)
-        )
+    true_residues = (
+        phi[batch, val_i]
+        * phi[batch, val_j]
+    )
 
-        predicted_factors = torch.exp(
-            predicted_log_factors
-        )
+    pred_residues = (
+        model.predict_gains(z, strike)
+        * model.predict_gains(z, pickup)
+    )
 
-        predicted_gains = model.predict_gains(
-            z,
-            points,
-        )
+    modal_error = (
+        (
+            (mu_pred - factors[val]).abs()
+            / factors[val]
+        ).mean()
+        * 100.0
+    )
 
-        predicted_residues = (
-            predicted_gains[:, :, None, :]
-            * predicted_gains[:, None, :, :]
-        )
-
-        target_residues = (
-            gains[:, :, None, :]
-            * gains[:, None, :, :]
-        )
-
-        residue_error += (
-            (predicted_residues - target_residues)
-            .square()
-            .sum()
-            .item()
-        )
-
-        residue_energy += (
-            target_residues
-            .square()
-            .sum()
-            .item()
-        )
-
-        factor_error.append(
-            (
-                torch.abs(
-                    predicted_factors - factors
-                )
-                / factors
-            ).cpu()
-        )
-
-    residue_rms = (
-        np.sqrt(
-            residue_error / residue_energy
+    transfer_error = (
+        torch.sqrt(
+            transfer_loss(
+                response(
+                    mu_pred,
+                    pred_residues,
+                ),
+                response(
+                    factors[val],
+                    true_residues,
+                ),
+            )
         )
         * 100.0
     )
 
-    factor_error = torch.cat(
-        factor_error
+    return (
+        modal_error.item(),
+        transfer_error.item(),
     )
-
-    modal_mean = (
-        factor_error.mean().item()
-        * 100.0
-    )
-
-    return residue_rms, modal_mean
 
 
 # ---------------------------------------------------------
 # Training
 # ---------------------------------------------------------
 
-best_residue = float("inf")
-best_state = None
-no_improvement = 0
+best_transfer = float("inf")
+
+for step in range(1, STEPS + 1):
+
+    idx = train[
+        torch.randint(
+            len(train),
+            (BATCH,),
+            device=device,
+        )
+    ]
+
+    p = points[idx]
+    phi = gains[idx]
+
+    i = torch.randint(
+        p.shape[1],
+        (BATCH, PAIRS),
+        device=device,
+    )
+
+    j = torch.randint(
+        p.shape[1],
+        (BATCH, PAIRS),
+        device=device,
+    )
+
+    # 25 % self-pairs stabilize modal gain magnitudes.
+    j[:, :PAIRS // 4] = i[:, :PAIRS // 4]
+
+    batch = torch.arange(
+        BATCH,
+        device=device,
+    )[:, None]
+
+    strike = p[batch, i]
+    pickup = p[batch, j]
+
+    true_residues = (
+        phi[batch, i]
+        * phi[batch, j]
+    )
+
+    z = model.encode_geometry(
+        geometry[idx]
+    )
+
+    log_mu = model.predict_log_factors(z)
+    mu_pred = torch.exp(log_mu)
+
+    pred_residues = (
+        model.predict_gains(z, strike)
+        * model.predict_gains(z, pickup)
+    )
+
+    loss_frequency = (
+        log_mu
+        - torch.log(factors[idx])
+    ).square().mean()
+
+    loss_transfer = transfer_loss(
+        response(
+            mu_pred,
+            pred_residues,
+        ),
+        response(
+            factors[idx],
+            true_residues,
+        ),
+    )
+
+    # Same gradual transfer-loss introduction
+    # as in the successful training run.
+    transfer_weight = min(
+        1.0,
+        step / 1250.0,
+    )
+
+    loss = (
+        FREQ_WEIGHT * loss_frequency
+        + transfer_weight * loss_transfer
+    )
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
 
-for epoch in range(1, EPOCHS + 1):
-    model.train()
+    if step == 1 or step % 250 == 0:
 
-    total_loss = 0.0
+        model.eval()
 
-    for masks, factors, points, gains in train_loader:
-        masks = masks.to(device)
-        factors = factors.to(device)
-        points = points.to(device)
-        gains = gains.to(device)
-
-        z = model.encode(masks)
-
-        predicted_log_factors = (
-            model.predict_log_factors(z)
+        modal_error, transfer_error = (
+            validate()
         )
 
-        predicted_gains = model.predict_gains(
-            z,
-            points,
-        )
+        model.train()
 
-        loss_points = residue_loss(
-            predicted_gains,
-            gains,
-        )
-
-        loss_frequency = frequency_loss(
-            predicted_log_factors,
-            torch.log(factors),
-        )
-
-        loss = (
-            loss_points
-            + FREQUENCY_WEIGHT
-            * loss_frequency
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-
-    val_residue, val_frequency = evaluate()
-
-
-    if val_residue < best_residue:
-        best_residue = val_residue
-
-        best_state = copy.deepcopy(
-            model.state_dict()
-        )
-
-        no_improvement = 0
-
-    else:
-        no_improvement += 1
-
-
-    if epoch == 1 or epoch % 10 == 0:
         print(
-            f"epoch {epoch:3d}"
-            f" | loss={total_loss / len(train_loader):.4f}"
-            f" | residue={val_residue:.2f}%"
-            f" | modal={val_frequency:.2f}%"
+            f"{step:5d}/{STEPS}"
+            f" | loss={loss.item():.4f}"
+            f" | modal={modal_error:.2f}%"
+            f" | transfer={transfer_error:.2f}%"
         )
 
+        if transfer_error < best_transfer:
+            best_transfer = transfer_error
 
-    if no_improvement >= PATIENCE:
-        print("Early stopping.")
-        break
+            torch.save(
+                model.state_dict(),
+                MODEL_PATH,
+            )
 
 
 # ---------------------------------------------------------
-# Save
+# Result
 # ---------------------------------------------------------
 
 model.load_state_dict(
-    best_state
+    torch.load(
+        MODEL_PATH,
+        map_location=device,
+        weights_only=True,
+    )
 )
 
-torch.save(
-    {
-        "model_state_dict": model.state_dict(),
-        "n_modes": N_MODES,
-        "validation_residue_rms": best_residue,
-    },
-    MODEL_PATH,
-)
+model.eval()
 
-final_residue, final_frequency = evaluate()
+modal_error, transfer_error = validate()
 
 print()
-print(
-    f"Best validation residue RMS: "
-    f"{final_residue:.3f}%"
-)
-
-print(
-    f"Validation modal mean error: "
-    f"{final_frequency:.3f}%"
-)
-
-print(
-    "Saved:",
-    MODEL_PATH,
-)
+print(f"Modal mean error: {modal_error:.3f}%")
+print(f"Transfer RMS:     {transfer_error:.3f}%")
+print("Saved:", MODEL_PATH)
