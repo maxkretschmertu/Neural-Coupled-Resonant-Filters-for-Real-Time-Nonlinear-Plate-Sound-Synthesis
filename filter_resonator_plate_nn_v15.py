@@ -24,7 +24,7 @@ params = {
     "excitation": 0,
     "x_e": -0.3, "y_e": 0.3,
     "x_p": 0.3, "y_p": 0.3,
-    "N_ex": 192, "A": 0.5,
+    "N_ex": 100, "A": 0.5,
     "impact_start": None, "changed": False,
 }
 
@@ -234,19 +234,13 @@ ttk.Button(
     command=lambda: params.__setitem__("excitation", 1 - params["excitation"]),
 ).pack(pady=6)
 
-add_slider("Excitation Amplitude", "A", 0.0, 2.0, False)
+add_slider("Size", "size", 0.1, 3.0)
 add_slider("Morph", "morph", 0.0, 1.0)
-add_slider("Size [m]", "size", 0.01, 5.0)
-add_slider("Aspect", "aspect", 0.5, 2.0)
-add_slider("Alpha_g", "alpha_g", 0.001, 5.0)
-
-ttk.Label(root, text="Excitation Length").pack()
-s = Scale(
-    root, from_=2, to=192, orient=HORIZONTAL, resolution=1,
-    command=lambda v: params.__setitem__("N_ex", int(float(v))),
-)
-s.set(params["N_ex"])
-s.pack(fill="x")
+add_slider("Shape", "aspect", 0.5, 2.0)
+add_slider("Damping", "alpha_g", 0.001, 5.0)
+add_slider("Damping Tilt", "alpha_r", 0.0, 0.0005)
+add_slider("Excitation Length", "N_ex", 2, 192, False)
+add_slider("Gain", "A", 0.0, 2.0, False)
 
 canvas.bind("<Button-1>", lambda e: set_point(e, "x_e", "y_e"))
 canvas.bind("<B1-Motion>", lambda e: set_point(e, "x_e", "y_e"))
