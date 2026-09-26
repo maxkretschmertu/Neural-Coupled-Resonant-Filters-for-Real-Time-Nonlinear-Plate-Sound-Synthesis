@@ -4,7 +4,7 @@ import torch
 
 from model import PlateNet
 
-N_MODES, STEPS, BATCH, PAIRS, N_FREQS = 32, 20000, 16, 32, 64
+N_MODES, STEPS, BATCH, PAIRS, N_FREQS = 128, 20000, 16, 32, 128
 DAMPING, FREQ_WEIGHT = 0.03, 10.0
 ROOT = Path(__file__).parent
 DATA = np.load(ROOT / "plate_dataset.npz")

@@ -5,14 +5,14 @@ from shapes import make_morph_contour
 from plate_reference import mesh_from_contour, solve_plate
 
 N_GEOMETRIES = 500
-N_MODES = 32
-N_POINTS = 32
+N_MODES = 128
+N_POINTS = 64
 OUTPUT = Path(__file__).parent / "plate_dataset.npz"
 
 
 def sample_geometries(n, rng):
     morph = (np.arange(n) + rng.random(n)) / n
-    aspect = 0.5 + 1.5 * (np.arange(n) + rng.random(n)) / n
+    aspect = 0.5 + 3.5 * (np.arange(n) + rng.random(n)) / n
     rng.shuffle(aspect)
     order = rng.permutation(n)
     return morph[order], aspect[order]

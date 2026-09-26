@@ -5,7 +5,7 @@ from torch import nn
 
 
 class PlateNet(nn.Module):
-    def __init__(self, n_modes=32, latent_dim=128, fourier_bands=8):
+    def __init__(self, n_modes=32, latent_dim=128, fourier_bands=16):
         super().__init__()
         self.fourier_bands = fourier_bands
 
@@ -28,7 +28,7 @@ class PlateNet(nn.Module):
         with torch.no_grad():
             output.bias.zero_()
             output.bias[0] = math.log(20.0)
-            output.bias[1:] = -2.1
+            output.bias[1:] = -3.2
 
     def encode_geometry(self, geometry):
         return self.geometry_net(torch.stack(

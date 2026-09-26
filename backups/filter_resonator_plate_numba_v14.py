@@ -7,8 +7,7 @@ from tkinter import ttk
 from numba import njit
 
 
-fs = 48000.0                                             #sample rate
-n_Modes = 32                                            # number of modes
+fs = 48000.0                                            #sample rate
 #f0 = 200
 alpha_r = 4e-5                                          #damping coeffincient inducing linear plate vibration charactersitics
 alpha_g = 0.3322                                        #damping coeffincient inducing linear plate vibration charactersitics
@@ -35,14 +34,15 @@ params = {
     "alpha_r": 4e-5,
 
     "tau": 1,                                           # user-set threshold for [p(n) - tau]_+
-    "eta": 0.01,                                           # coupling strength between filters (off-diagonal scale)
-    "lamb": 0.01,                                          # self-inhibition strength (diagonal = -lamb)
+    "eta": 0.1,                                           # coupling strength between filters (off-diagonal scale)
+    "lamb": 0.1,                                          # self-inhibition strength (diagonal = -lamb)
 
     "Lx": 1.0,                                          # plate length in x-direction (meters)
     "Ly": 1.0,                                          # plate length in y-direction (meters)
     "D": 18300,                                         # flexural rigidity (N*m)
     "rho": 7800.0,                                      # density (kg/m^3)
     "H": 0.01,                                          # plate thickness (meters)
+    "x": 10,                                             # number of modes in directions of Lx and Ly
     "excitation": 0,
     "x_e": 0.3,                                         # excitation position x (normalized 0..1)
     "y_e": 0.3,                                         # excitation position y (normalized 0..1)
@@ -69,81 +69,6 @@ def modes_to_freqs(modes, Lx, Ly, D, rho, H):
         out.append(om / (2 * np.pi))
     return out
 
-def rectangle_modal_factors(modes, aspect):
-    """
-    Dimensionless modal factors of a simply-supported
-    unit-area rectangular plate.
-    """
-    factors = []
-
-    for m, n in modes:
-        mu = np.pi**2 * (
-            m**2 / aspect
-            + aspect * n**2
-        )
-        factors.append(mu)
-
-    return np.asarray(factors, dtype=np.float64)
-
-
-def modal_factors_to_freqs(modal_factors, size, D, rho, H):
-    """
-    Convert dimensionless modal factors to physical frequencies.
-    """
-    omega = (
-        modal_factors
-        * np.sqrt(D / (rho * H))
-        / size**2
-    )
-
-    return omega / (2 * np.pi)
-
-def analytic_rectangle_model(
-    Lx, Ly, D, rho, H,
-    x_e, y_e,
-    n_modes = n_Modes,
-):
-    # Genug (m, n)-Kandidaten erzeugen.
-    # Bei 16 Zielmoden sind 16 x 16 = 256 Kandidaten billig.
-    candidate_modes = [
-        (m, n)
-        for m in range(1, n_modes + 1)
-        for n in range(1, n_modes + 1)
-    ]
-
-    aspect = Lx / Ly
-    size = np.sqrt(Lx * Ly)
-
-    candidate_factors = rectangle_modal_factors(
-        candidate_modes,
-        aspect,
-    )
-
-    candidate_freqs = modal_factors_to_freqs(
-        candidate_factors,
-        size,
-        D,
-        rho,
-        H,
-    )
-
-    order = np.argsort(candidate_freqs)[:n_modes]
-
-    modes = [candidate_modes[i] for i in order]
-    modal_factors = candidate_factors[order]
-    freqs = candidate_freqs[order]
-
-    # Modale Empfindlichkeit an der Anschlagposition
-    strike_gains = np.asarray(
-        [
-            np.sin(m * np.pi * x_e)
-            * np.sin(n * np.pi * y_e)
-            for m, n in modes
-        ],
-        dtype=np.float64,
-    )
-
-    return modes, modal_factors, freqs, strike_gains
 
 #Calculation of the distribution matrix M
 def distribution_matrix(freqs_arr, eta=0.01, lamb=1.0):
@@ -171,11 +96,11 @@ def distribution_matrix(freqs_arr, eta=0.01, lamb=1.0):
 
 
 #Defining the excitation signal for the case of simulating impact
-def excitation_signal(pos, mode_gains, N_ex=2, A=0.5):
+def excitation_signal(pos, modes, x=0.3, y=0.7, N_ex=2, A=0.5):
     """
     Kurzer Anregungsimpuls (sin^2-Huellkurve), Dauer N_ex Samples.
     pos    : Sample-Index array, NICHT durch fs geteilt
-    mode_gains : list of mode gains, one per filter -- used to weight
+    modes  : list of (l, m) mode indices, one per filter -- used to weight
              each filter's excitation by its own mode shape at (x, y)
     N_ex   : Pulsdauer in Samples (Default 192 = 4 ms bei fs=48000)
 
@@ -183,7 +108,7 @@ def excitation_signal(pos, mode_gains, N_ex=2, A=0.5):
     scaled by that mode's spatial sensitivity to a strike at (x, y).
     """
     pos = np.asarray(pos, dtype=np.float64)
-    n = len(mode_gains)
+    n = len(modes)
     frames = pos.shape[0]
 
     if params.get("excitation") == 0:
@@ -195,9 +120,9 @@ def excitation_signal(pos, mode_gains, N_ex=2, A=0.5):
         u = (pos % int(fs) == 0).astype(np.float64)
 
     u_ex = np.empty((n, frames), dtype=np.float64)
-
-    for k in range(n):
-        u_ex[k, :] = mode_gains[k] * u
+    for k, (l, m) in enumerate(modes):
+        weight = np.sin(l * np.pi * x) * np.sin(m * np.pi * y)
+        u_ex[k, :] = weight * u
 
     return np.ascontiguousarray(u_ex, dtype=np.float64)
 
@@ -305,15 +230,8 @@ def update_canvas():
 
 
 # initial modes / frequencies
-filter_modes, modal_factors,filter_freqs, strike_gains = analytic_rectangle_model(
-    params["Lx"],
-    params["Ly"],
-    params["D"],
-    params["rho"],
-    params["H"],
-    params["x_e"],
-    params["y_e"],
-)
+filter_modes = get_modes(params["x"])
+filter_freqs = modes_to_freqs(filter_modes, params["Lx"], params["Ly"], params["D"], params["rho"], params["H"])
 
 _freqs_np_init = np.asarray(filter_freqs, dtype=np.float64)
 _alphas_init = np.exp(params["alpha_g"] + params["alpha_r"] * _freqs_np_init)
@@ -345,21 +263,15 @@ def callback(outdata, frames, time, status):
     if status:
         print(status)
 
-    global filter_modes, modal_factors, filter_freqs, strike_gains, Z, states, last_params, M, last_T
+    global filter_modes, filter_freqs, Z, states, last_params, M, last_T
+
 
     if params["changed"]:
         last_params = params.copy()
 
-        filter_modes, modal_factors, filter_freqs, strike_gains = analytic_rectangle_model(
-            params["Lx"],
-            params["Ly"],
-            params["D"],
-            params["rho"],
-            params["H"],
-            params["x_e"],
-            params["y_e"],
-        )
 
+        filter_modes = get_modes(params["x"])
+        filter_freqs = modes_to_freqs(filter_modes, params["Lx"], params["Ly"], params["D"], params["rho"], params["H"])
         freqs_np = np.asarray(filter_freqs, dtype=np.float64)
 
         alphas = np.exp(params["alpha_g"] + params["alpha_r"] * freqs_np)
@@ -381,7 +293,7 @@ def callback(outdata, frames, time, status):
     if params.get("impact_start") is None:
         u = np.zeros((n, frames), dtype=np.float64)
     else:
-        u = excitation_signal(pos - params["impact_start"], strike_gains, params["N_ex"], params["A"],)
+        u = excitation_signal(pos - params["impact_start"], filter_modes, params["x_e"], params["y_e"], params["N_ex"], params["A"])
     u = np.ascontiguousarray(u, dtype=np.float64)
 
     s_out = np.empty(frames, dtype=np.float64)
@@ -411,10 +323,6 @@ stream.start()
 for f in filter_freqs:
     print(f"Filter frequency: {f:.2f} Hz")
 
-def set_model_param(name, value):
-    params[name] = float(value)
-    params["changed"] = True
-
 root.title("Resonator Filter GUI (Numba)")
 frm = ttk.Frame(root, padding=10)
 
@@ -425,51 +333,29 @@ ttk.Label(root, text="Excitation Amplitude").pack()
 gain_slider.pack(fill="x")
 gain_slider.set(params["A"])
 
-strike_btn = ttk.Button(root, text="Strike", command=_strike)
-strike_btn.pack(pady=6)
-
-excitation_btn = ttk.Button(
-    root,
-    text="Toggle Excitation",
-    command=lambda: params.__setitem__(
-        "excitation",
-        1 - params["excitation"]
-    )
-)
-excitation_btn.pack(pady=6)
-
-base_slider = ttk.Scale(
-    root,
-    from_=0.001,
-    to=2,
-    orient="horizontal",
-    command=lambda v: set_model_param("Lx", v)
-)
+base_slider = ttk.Scale(root, from_=0.001, to=2, orient="horizontal",
+                         command=lambda v: params.__setitem__("Lx", float(v)))
 ttk.Label(root, text="Lx").pack()
 base_slider.pack(fill="x")
 base_slider.set(params["Lx"])
 
-base_slider = ttk.Scale(
-    root,
-    from_=0.001,
-    to=2,
-    orient="horizontal",
-    command=lambda v: set_model_param("Ly", v)
-)
+base_slider = ttk.Scale(root, from_=0.001, to=2, orient="horizontal",
+                         command=lambda v: params.__setitem__("Ly", float(v)))
 ttk.Label(root, text="Ly").pack()
 base_slider.pack(fill="x")
 base_slider.set(params["Ly"])
 
-spacing_slider = ttk.Scale(
-    root,
-    from_=0.001,
-    to=5,
-    orient="horizontal",
-    command=lambda v: set_model_param("alpha_g", v)
-)
+spacing_slider = ttk.Scale(root, from_=0.001, to=5, orient="horizontal",
+                            command=lambda v: params.__setitem__("alpha_g", float(v)))
 ttk.Label(root, text="Alpha_g").pack()
 spacing_slider.pack(fill="x")
 spacing_slider.set(params["alpha_g"])
+
+number_slider = Scale(root, from_=1, to=18, orient="horizontal", resolution=1,
+                       command=lambda v: params.__setitem__("x", int(float(v))))
+ttk.Label(root, text="Number of Modes").pack()
+number_slider.pack(fill="x")
+number_slider.set(params["x"])
 
 excitation_slider = Scale(root, from_=2, to=192, orient="horizontal", resolution=1,
                        command=lambda v: params.__setitem__("N_ex", int(float(v))))
@@ -479,6 +365,13 @@ excitation_slider.set(params["N_ex"])
 
 
 ttk.Label(frm, text="Filter GUI").grid(column=0, row=0)
+
+strike_btn = ttk.Button(root, text="Strike", command=_strike)
+strike_btn.pack(pady=6)
+
+excitation_btn = ttk.Button(root, text="Toggle Excitation", command=lambda: params.__setitem__("excitation", 1 - params["excitation"]))
+excitation_btn.pack(pady=6)
+
 
 
 
@@ -502,7 +395,6 @@ def _on_move(event):
     py = min(max(event.y, 0), canvas_size - 1)
     params['x_e'] = px / (canvas_size - 1)
     params['y_e'] = 1.0 - (py / (canvas_size - 1))
-    params["changed"] = True
     _draw_point()
 
 def _on_release(event):
